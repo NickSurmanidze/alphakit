@@ -1,0 +1,26 @@
+[project]
+name = "alphakit-workspace"
+version = "0.0.0"
+requires-python = ">=3.13,<3.14"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["apps/backtester"]
+
+[tool.ruff]
+line-length = 100
+
+# Notebooks: suppress style/complexity rules that are noisy in exploratory code.
+# F401/F841 = unused imports/vars (common in cells), F541 = f-string w/o placeholder,
+# E402 = import not at top of cell, E703 = trailing semicolons, B905 = zip strict=,
+# PLR* = pylint complexity rules.
+[tool.ruff.lint.per-file-ignores]
+"notebooks/**" = [
+    "E501", "E402", "E701", "E702", "E703",
+    "F401", "F541", "F811", "F841",
+    "I001", "B905",
+    "PLR0124", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004", "PLR5501", "PLW2901",
+]

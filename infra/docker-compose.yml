@@ -1,0 +1,56 @@
+name: alphakit
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    environment:
+      - MONGO_INITDB_DATABASE=mongo
+      - MONGO_INITDB_ROOT_USERNAME=mongo
+      - MONGO_INITDB_ROOT_PASSWORD=mongo
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_data:/data/db
+      - ./mongo/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+    networks:
+      - alphakit-network
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "63794:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - alphakit-network
+
+  timescale:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=timescale
+      - POSTGRES_USER=timescale
+      - POSTGRES_PASSWORD=timescale
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    command: postgres -c max_connections=1000
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d timescale -U timescale"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - alphakit-network
+
+volumes:
+  mongo_data:
+  redis_data:
+  timescale_data:
+
+networks:
+  alphakit-network:
+    driver: bridge

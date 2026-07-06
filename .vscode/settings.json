@@ -1,0 +1,41 @@
+{
+  "[python]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.codeActionsOnSave": {
+      "source.fixAll.ruff": "explicit",
+      "source.organizeImports.ruff": "explicit"
+    }
+  },
+
+  // Python
+  "python.analysis.typeCheckingMode": "basic",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportPrivateImportUsage": "none"
+  },
+  // If you keep a local venv at ./.venv, VS Code usually auto-detects it.
+  // Uncomment and adjust if needed (Windows: .venv\\\\Scripts\\\\python.exe)
+  // "python.defaultInterpreterPath": ".venv/bin/python",
+
+  // Testing
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestArgs": ["-q", "apps/backtester/tests"],
+
+  // Jupyter
+  "jupyter.notebookFileRoot": "${workspaceFolder}",
+
+  // Housekeeping
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.mypy_cache": true,
+    "**/.ruff_cache": true
+  },
+  "files.trimTrailingWhitespace": true,
+  "mypy.preferDaemon": true,
+  "mypy.interpreter": ["${workspaceFolder}/.venv/bin/python"],
+  "mypy.dmypyExecutable": "${workspaceFolder}/.venv/bin/dmypy",
+  "mypy.configFile": "apps/backtester/pyproject.toml",
+  "mypy.args": ["--strict"],
+  "cSpell.enabled": false
+}

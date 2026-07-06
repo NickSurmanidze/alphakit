@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat /Users/nick/Library/Jupyter/kernels/python397jvsc74a57bd0f3f5d4ea7e6233323d111af5735a0eff1ab83855e68644ff57bce73a11ad8059/kernel.json)",
+      "Read(//Users/nick/Library/Jupyter/kernels/python397jvsc74a57bd0f3f5d4ea7e6233323d111af5735a0eff1ab83855e68644ff57bce73a11ad8059/**)",
+      "Bash(/Users/nick/Documents/www/alphakit/backtesting/.venv/bin/python -c \"import ipykernel; print\\('ipykernel ok'\\)\")",
+      "Bash(/Users/nick/Documents/www/alphakit/backtesting/.venv/bin/python -m ipykernel install --user --name alphakit --display-name \"alphakit \\(Python 3.13\\)\")",
+      "Bash(cat /Users/nick/Library/Jupyter/kernels/alphakit/kernel.json)",
+      "Read(//Users/nick/Library/Jupyter/kernels/alphakit/**)"
+    ]
+  }
+}

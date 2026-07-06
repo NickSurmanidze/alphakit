@@ -1,0 +1,40 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Lint (backtester)",
+      "type": "shell",
+      "command": "make lint-backtester",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Format (backtester)",
+      "type": "shell",
+      "command": "make format-backtester",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Tests (backtester)",
+      "type": "shell",
+      "command": "make test-backtester",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Infra up (mongo/redis/timescale)",
+      "type": "shell",
+      "command": "make infra-up",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Infra down",
+      "type": "shell",
+      "command": "make infra-down",
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}
