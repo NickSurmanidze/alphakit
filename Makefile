@@ -1,7 +1,7 @@
 .PHONY: setup setup-py setup-js \
 	infra-up infra-down infra-logs infra-ps \
 	test test-backtester lint lint-backtester format format-backtester \
-	dev-papertrade
+	dev-backend dev-ui seed-user
 
 ## Install Python (uv workspace) and Node (pnpm workspace) dependencies
 setup: setup-py setup-js
@@ -43,5 +43,11 @@ format-backtester:
 	uv run --package backtester ruff format apps/backtester
 
 ## App dev servers
-dev-papertrade:
-	pnpm --filter kraken-arb-papertrade dev
+dev-backend:
+	pnpm --filter trading-system-backend dev
+
+dev-ui:
+	pnpm --filter trading-system-ui dev
+
+seed-user:
+	pnpm --filter trading-system-backend seed:user -- $(ARGS)
