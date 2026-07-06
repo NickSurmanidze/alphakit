@@ -5,5 +5,23 @@
   "packageManager": "pnpm@8.12.1",
   "engines": {
     "node": ">=22"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "pnpm --filter trading-system-backend typecheck && pnpm --filter trading-system-ui typecheck",
+    "test": "pnpm --filter trading-system-backend test"
+  },
+  "pnpm": {
+    "overrides": {
+      "ioredis": "5.10.1"
+    }
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.6.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.3",
+    "globals": "^17.7.0",
+    "typescript-eslint": "^8.62.1"
   }
 }

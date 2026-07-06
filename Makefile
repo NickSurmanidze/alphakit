@@ -1,7 +1,7 @@
 .PHONY: setup setup-py setup-js \
 	infra-up infra-down infra-logs infra-ps \
 	test test-backtester lint lint-backtester format format-backtester \
-	dev-backend dev-ui seed-user
+	dev-backend dev-ui seed-user migrate-timescale
 
 ## Install Python (uv workspace) and Node (pnpm workspace) dependencies
 setup: setup-py setup-js
@@ -51,3 +51,6 @@ dev-ui:
 
 seed-user:
 	pnpm --filter trading-system-backend seed:user -- $(ARGS)
+
+migrate-timescale:
+	pnpm --filter trading-system-backend migrate:timescale

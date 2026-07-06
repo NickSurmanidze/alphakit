@@ -8,17 +8,29 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "seed:user": "tsx scripts/seed-user.ts"
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "seed:user": "tsx scripts/seed-user.ts",
+    "seed:calendars": "tsx scripts/seed-calendars.ts",
+    "migrate:timescale": "tsx scripts/migrate-timescale.ts"
   },
   "dependencies": {
+    "@bull-board/api": "^8.1.1",
+    "@bull-board/express": "^8.1.1",
     "@trpc/server": "^11.18.0",
     "bcrypt": "^6.0.0",
+    "bullmq": "^5.79.2",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "ioredis": "5.10.1",
     "jsonwebtoken": "^9.0.3",
     "mongodb": "^7.4.0",
+    "node-cron": "^4.6.0",
+    "pg": "^8.22.0",
+    "yahoo-finance2": "^3.15.4",
     "zod": "^4.4.3"
   },
   "devDependencies": {
@@ -28,7 +40,9 @@
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^26.1.0",
+    "@types/pg": "^8.20.0",
     "tsx": "^4.23.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
   }
 }

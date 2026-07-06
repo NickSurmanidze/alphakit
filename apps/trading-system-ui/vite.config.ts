@@ -16,6 +16,12 @@ export default defineConfig({
       '/trpc': {
         target: 'http://localhost:4000',
         changeOrigin: true
+      },
+      // Bull Board -- proxied too so its auth cookie is same-origin in dev, matching prod
+      // where the backend serves everything from one origin.
+      '/admin': {
+        target: 'http://localhost:4000',
+        changeOrigin: true
       }
     }
   }

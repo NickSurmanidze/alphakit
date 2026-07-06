@@ -1,7 +1,7 @@
 import { TRPCError } from '@trpc/server';
 
 import { getUserByEmail, getUserById, bumpTokenVersion } from '../users/users.repository.js';
-import { PublicUser, toPublicUser } from '../users/users.types.js';
+import { PublicUser, toPublicUser, UserDoc } from '../users/users.types.js';
 import { verifyPassword } from './password.js';
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from './jwt.js';
 
@@ -68,3 +68,19 @@ export const refreshSession = async (refreshToken: string): Promise<AuthTokens> 
 export const logout = async (userId: string): Promise<void> => {
   await bumpTokenVersion(userId);
 };
+
+/** Read-only session check (no token rotation) -- used wherever a Bearer access token isn't
+ * available and the httpOnly refresh cookie is the only usable credential: Bull Board (opened
+ * in a new tab) and the SSE subscription link (native EventSource can't set custom headers). */
+export const getUserFromRefreshToken = async (refreshToken: string): Promise<UserDoc | null> => {
+  try {
+    const payload = verifyRefreshToken(refreshToken);
+    const user = await getUserById(payload.userId);
+    return user && user.tokenVersion === payload.tokenVersion ? user : null;
+  } catch {
+    return null;
+  }
+};
+
+export const isValidRefreshToken = async (refreshToken: string): Promise<boolean> =>
+  (await getUserFromRefreshToken(refreshToken)) !== null;

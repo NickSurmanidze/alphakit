@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { httpBatchLink } from '@trpc/client';
+import { httpBatchLink, httpSubscriptionLink, splitLink } from '@trpc/client';
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
 
 import { trpc } from './trpc';
@@ -18,10 +18,20 @@ const queryClient = new QueryClient();
 
 const trpcClient = trpc.createClient({
   links: [
-    httpBatchLink({
-      url: '/trpc',
-      fetch: (url, options) => fetch(url, { ...options, credentials: 'include' }),
-      headers: () => (currentAccessToken ? { authorization: `Bearer ${currentAccessToken}` } : {})
+    splitLink({
+      condition: op => op.type === 'subscription',
+      // Subscriptions ride the browser's native EventSource, which can't set an Authorization
+      // header -- withCredentials sends the httpOnly refresh cookie instead, which the tRPC
+      // context accepts as a fallback (see server trpc/context.ts).
+      true: httpSubscriptionLink({
+        url: '/trpc',
+        eventSourceOptions: { withCredentials: true }
+      }),
+      false: httpBatchLink({
+        url: '/trpc',
+        fetch: (url, options) => fetch(url, { ...options, credentials: 'include' }),
+        headers: () => (currentAccessToken ? { authorization: `Bearer ${currentAccessToken}` } : {})
+      })
     })
   ]
 });
