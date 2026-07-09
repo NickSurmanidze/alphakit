@@ -7,6 +7,13 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from backtester.exchange.event_log import (
+    PositionClosed,
+    PositionIncreased,
+    PositionLiquidated,
+    PositionOpened,
+    PositionReduced,
+)
 from backtester.exchange.types import (
     MarginAllocationType,
     OrderExecutionType,
@@ -20,6 +27,9 @@ if TYPE_CHECKING:
 
 
 class Position:
+    """One open or closed futures/margin position's full state, including its running
+    (or, once closed, final realized) PnL and liquidation status."""
+
     def __init__(  # noqa: PLR0913
         self,
         id: str,
@@ -34,6 +44,8 @@ class Position:
         margin_used_in_usd: float,
         close_time: datetime | None = None,
     ):
+        """Sets identity/sizing fields as given; pnl_in_usd/liquidation_price/liquidated
+        all start at their "nothing has happened yet" defaults."""
         self.id: str = id
         self.side: PositionSide = side
         self.symbol: str = symbol
@@ -52,18 +64,25 @@ class Position:
 
 
 class Positions:
+    """Opens, increases, reduces, closes, and liquidates futures/margin positions for
+    one Exchange, keeping open and closed positions in separate dicts."""
+
     def __init__(self, exchange: Exchange) -> None:
+        """Starts with no positions."""
         self.exchange = exchange
         self.open_positions: dict[str, Position] = {}
         self.closed_positions: dict[str, Position] = {}
 
     def get_positions(self) -> list[Position]:
+        """Returns every position, open and closed."""
         return list(self.open_positions.values()) + list(self.closed_positions.values())
 
     def get_open_positions(self) -> dict[str, Position]:
+        """Returns the open-positions dict, keyed by symbol."""
         return self.open_positions
 
     def get_open_position_by_symbol(self, symbol: str) -> Position | None:
+        """Returns the open position for `symbol`, or None if flat."""
         return self.open_positions.get(symbol)
 
     def add_position(
@@ -74,6 +93,11 @@ class Positions:
         volume: float,
         reduce_only: bool = False,
     ):
+        """Routes a fill to the right position operation: opens a new position if flat,
+        increases if adding to the same side, or reduces/flips if the fill is on the
+        opposite side of an existing position (closing it first, then opening the
+        remainder in the new direction if the fill volume exceeds the existing
+        position's)."""
         existing_position = self.get_open_position_by_symbol(symbol=symbol)
 
         if existing_position is None:
@@ -95,6 +119,8 @@ class Positions:
     def create_position(
         self, side: PositionSide, price: float, symbol: str, volume: float
     ) -> Position:
+        """Opens a brand-new position at `price`/`volume`, locks its required margin,
+        and records a PositionOpened event."""
         asset, quote = symbol.split("/")
         value_in_usd = self.exchange.convert_asset_volume(volume, from_asset=asset, to_asset="USD")
         cost_in_usd = price * volume
@@ -115,9 +141,24 @@ class Positions:
         self.open_positions[position.symbol] = position
         self.exchange.balance.lock_balance(asset=quote, volume=position.margin_used_in_usd)
 
+        self.exchange.event_log.emit(
+            PositionOpened(
+                time=position.open_time,
+                position_id=position.id,
+                symbol=position.symbol,
+                side=position.side,
+                volume=position.volume,
+                price=position.average_entry_price,
+                margin_used_in_usd=position.margin_used_in_usd,
+            )
+        )
+
         return position
 
     def increase_position_volume(self, position: Position, price: float, volume: float) -> Position:
+        """Adds `volume` more to an existing same-side position at `price`, recomputing
+        its weighted-average entry price and margin, and records a PositionIncreased
+        event."""
         asset, quote = position.symbol.split("/")
         cost_in_usd = price * volume
 
@@ -136,9 +177,27 @@ class Positions:
         position.collateral_used_in_usd = position.collateral_used_in_usd + cost_in_usd
 
         self.open_positions[position.symbol] = position
+
+        self.exchange.event_log.emit(
+            PositionIncreased(
+                time=self.exchange.market.current["time_close"].to_pydatetime(),
+                position_id=position.id,
+                symbol=position.symbol,
+                side=position.side,
+                added_volume=volume,
+                price=price,
+                new_volume=position.volume,
+                new_average_entry_price=position.average_entry_price,
+            )
+        )
+
         return position
 
     def reduce_position_volume(self, position: Position, price: float, volume: float):
+        """Reduces `position` by `volume` at `price` (or fully closes it if `volume`
+        covers the whole position), realizing PnL to the cash balance and unlocking a
+        proportional share of margin. Records a PositionClosed or PositionReduced event
+        depending on whether the position ended up closed."""
         should_close = position.volume <= volume
 
         if should_close:
@@ -179,16 +238,47 @@ class Positions:
         if should_close:
             position.status = PositionStatus.closed
             position.close_time = self.exchange.market.current["time_close"].to_pydatetime()
+            # Finalize the realized PnL of this close onto the position before it's copied
+            # into closed_positions -- without this it carries whatever pnl_in_usd was last
+            # set by refresh_position() (unrealized, possibly stale), not this close's
+            # actual realized amount.
+            position.pnl_in_usd = pnl_in_usd
             self.closed_positions[position.id] = copy.deepcopy(position)
             del self.open_positions[position.symbol]
+            self.exchange.event_log.emit(
+                PositionClosed(
+                    time=position.close_time,
+                    position_id=position.id,
+                    symbol=position.symbol,
+                    side=position.side,
+                    volume=volume,
+                    price=price,
+                    realized_pnl_in_usd=pnl_in_usd,
+                )
+            )
         else:
             self.open_positions[position.symbol] = position
+            self.exchange.event_log.emit(
+                PositionReduced(
+                    time=self.exchange.market.current["time_close"].to_pydatetime(),
+                    position_id=position.id,
+                    symbol=position.symbol,
+                    side=position.side,
+                    reduced_volume=volume,
+                    price=price,
+                    remaining_volume=position.volume,
+                    realized_pnl_in_usd=pnl_in_usd,
+                )
+            )
 
         return True
 
     def calculate_required_margin(
         self, side: PositionSide, symbol: str, volume: float, price: float
     ) -> float:
+        """Estimates the margin a new fill of `volume`/`price` would require: zero (or
+        reduced) if it would only reduce an existing opposite-side position, otherwise
+        the full (or net-additional) notional divided by max leverage."""
         added_volume = volume
         position = self.get_open_position_by_symbol(symbol=symbol)
         if position is not None:
@@ -201,6 +291,10 @@ class Positions:
         return added_volume * price / self.exchange.max_leverage if added_volume else 0
 
     def liquidate_position(self, position: Position):
+        """Force-closes `position` for a total loss of its margin (not just the realized
+        PnL loss up to that point): the margin is forfeited entirely, not just debited by
+        the loss amount, then the position moves to closed_positions with liquidated=True
+        and a PositionLiquidated event is recorded."""
         position.status = PositionStatus.closed
         position.liquidated = True
         position.close_time = self.exchange.market.current["time_close"].to_pydatetime()
@@ -213,16 +307,31 @@ class Positions:
 
         self.closed_positions[position.id] = copy.deepcopy(position)
         del self.open_positions[position.symbol]
-        print("****** Liquidation ********")
+        self.exchange.event_log.emit(
+            PositionLiquidated(
+                time=position.close_time,
+                position_id=position.id,
+                symbol=position.symbol,
+                side=position.side,
+                volume=position.volume,
+                margin_used_in_usd=position.margin_used_in_usd,
+            )
+        )
 
     def get_total_unrealized_pnl(self) -> float:
+        """Sums pnl_in_usd across every currently-open position."""
         return sum(p.pnl_in_usd for p in self.open_positions.values())
 
     def liquidate_all_positions(self):
+        """Liquidates every open position (e.g. a cross-margin account-wide margin
+        call)."""
         for position in copy.deepcopy(self.open_positions).values():
             self.liquidate_position(position=position)
 
     def refresh_position(self, position: Position):
+        """Marks `position` to the current market price, recomputing its unrealized
+        pnl_in_usd, and liquidates it if isolated margin has been exhausted (loss
+        exceeds the position's own margin)."""
         asset, quote = position.symbol.split("/")
         position.value_in_usd = self.exchange.convert_asset_volume(
             volume=position.volume, from_asset=asset, to_asset="USD"
@@ -248,6 +357,9 @@ class Positions:
                 self.liquidate_position(position=position)
 
     def refresh_open_positions(self):
+        """Marks every open position to market, then (for cross margin) liquidates
+        everything at once if the account's total unrealized loss exceeds its total
+        balance."""
         for position in copy.deepcopy(self.open_positions).values():
             self.refresh_position(position=position)
 
@@ -258,6 +370,8 @@ class Positions:
                 self.liquidate_all_positions()
 
     def close_position(self, position: Position):
+        """Closes `position` by placing an opposite-side reduce_only market order for
+        its full volume (raises if the symbol isn't actually open)."""
         if position.symbol in self.open_positions:
             if position.side == PositionSide.long:
                 self.exchange.orders.create_order(
@@ -283,5 +397,11 @@ class Positions:
             raise ValueError("Position does not seem to exist!!")
 
     def close_all_open_positions(self):
-        for position in self.open_positions.values():
+        """Closes every currently-open position."""
+        # list(...) snapshots the values before iterating -- close_position() synchronously
+        # fills a market order for futures, which deletes from open_positions mid-loop (via
+        # reduce_position_volume). Iterating the live dict directly raises "dictionary
+        # changed size during iteration" the moment 2+ positions are open. Matches the
+        # snapshot-before-iterating convention liquidate_all_positions() already uses.
+        for position in list(self.open_positions.values()):
             self.close_position(position=position)

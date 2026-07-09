@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from backtester.exchange.event_log import OrderCanceled, OrderCreated, OrderFilled
 from backtester.exchange.types import (
     MarketType,
     OrderExecutionType,
@@ -20,6 +21,10 @@ if TYPE_CHECKING:
 
 # price is used as both fill price and trigger price for stoplossLimit orders
 class Order:
+    """A single order's full lifecycle state: identity, execution parameters, and (once
+    processed) the fill-accounting fields (sell/buy volumes, fees, slippage-adjusted
+    price) add_order_processing_logic() computes."""
+
     def __init__(  # noqa: PLR0913
         self,
         id: str,
@@ -34,6 +39,9 @@ class Order:
         is_reduce_only: bool = False,
         reason: str = "",
     ):
+        """Sets identity/execution fields as given; fill-accounting fields (sell/buy
+        volume, fees, price_with_slippage) start zeroed until
+        add_order_processing_logic() computes them."""
         self.id: str = id
         self.side: OrderSide = side
         self.execution_type: OrderExecutionType = execution_type
@@ -63,16 +71,22 @@ class Order:
 
 
 class Orders:
+    """Creates, validates, matches, and cancels every order type (market/limit/
+    stoploss-limit, including OCO pairs) for one Exchange."""
+
     def __init__(self, exchange: Exchange) -> None:
+        """Starts with no orders."""
         self.exchange = exchange
         self.orders: dict[str, Order] = {}
 
     def get_orders(self, status: OrderStatus | None = None) -> list[Order]:
+        """Returns every order, optionally filtered to one status."""
         if status:
             return [o for o in self.orders.values() if o.status == status]
         return list(self.orders.values())
 
     def get_order_by_id(self, id: str) -> Order:
+        """Looks up an order by id (raises if not found)."""
         if id not in self.orders:
             raise ValueError(f"Order {id} not found!")
         return self.orders[id]
@@ -86,6 +100,11 @@ class Orders:
         is_reduce_only: bool = False,
         reason: str = "",
     ):
+        """Creates a one-cancels-the-other stop-loss/take-profit pair: a stoplossLimit
+        sell at `stop_loss_price` and a limit sell at `take_profit_price`, each
+        referencing the other so filling one auto-cancels the other (see refresh_order).
+        Only the stop-loss leg locks balance, to avoid double-locking for the same
+        underlying exit."""
         sl_order: Order = Order(
             id=str(uuid.uuid4()),
             side=OrderSide.sell,
@@ -130,10 +149,12 @@ class Orders:
         if sl_order.id in self.orders.keys():
             raise ValueError("Failed to create order. ID is already in use.")
         self.orders[sl_order.id] = sl_order
+        self._emit_order_created(sl_order)
 
         if tp_order.id in self.orders.keys():
             raise ValueError("Failed to create order. ID is already in use.")
         self.orders[tp_order.id] = tp_order
+        self._emit_order_created(tp_order)
 
         self.lock_balance(order=sl_order)
 
@@ -149,6 +170,9 @@ class Orders:
         is_reduce_only: bool = False,
         reason: str = "",
     ):
+        """Builds, validates, and registers a new order (market orders fill immediately
+        via refresh_order(); limit/stoploss orders stay open until a later tick's price
+        action triggers them)."""
         order: Order = Order(
             id=str(uuid.uuid4()),
             side=side,
@@ -175,6 +199,7 @@ class Orders:
         order.has_locked_balance = True
         self.lock_balance(order=order)
         self.orders[order.id] = order
+        self._emit_order_created(order)
 
         if order.execution_type == OrderExecutionType.market:
             order = self.refresh_order(order=order)
@@ -182,39 +207,50 @@ class Orders:
         return order
 
     def update_order(self, order: Order) -> Order:
+        """Writes `order` back into the orders dict (re-saves its current state)."""
         self.orders[order.id] = order
         return order
 
     def lock_balance(self, order: Order) -> None:
+        """Locks the order's sell-side balance as margin -- spot only; futures margin is
+        locked separately when the resulting position is opened/sized."""
         if self.exchange.market_type == MarketType.spot and order.sell_asset is not None:
             self.exchange.balance.lock_balance(asset=order.sell_asset, volume=order.sell_volume)
 
     def unlock_balance(self, order: Order) -> None:
+        """Releases a spot order's previously-locked sell-side balance (e.g. on cancel
+        or fill)."""
         if (
             self.exchange.market_type == MarketType.spot
             and order.has_locked_balance
             and order.sell_asset is not None
         ):
-            self.exchange.balance.unlock_balance(
-                asset=order.sell_asset, volume=order.sell_volume
-            )
+            self.exchange.balance.unlock_balance(asset=order.sell_asset, volume=order.sell_volume)
 
     def cancel_order(self, order: Order) -> Order:
+        """Cancels `order` (and its OCO partner, if any, while still open), unlocking
+        any balance each had locked."""
         if order.is_oco and order.oco_reference is not None:
             oco_order = self.get_order_by_id(id=order.oco_reference)
             if oco_order.status == OrderStatus.open:
                 oco_order.status = OrderStatus.canceled
                 self.unlock_balance(order=oco_order)
                 oco_order = self.update_order(order=oco_order)
+                self._emit_order_canceled(oco_order)
 
         if order.status == OrderStatus.open:
             order.status = OrderStatus.canceled
             order = self.update_order(order=order)
             self.unlock_balance(order=order)
+            self._emit_order_canceled(order)
 
         return order
 
     def add_order_processing_logic(self, order: Order) -> Order:
+        """Computes an order's fill-accounting fields: slippage-adjusted price (market
+        orders only), which asset/volume is sold vs. bought, and the fee (taker for
+        market, maker for limit/stoploss), folded into the sell or buy side depending on
+        order direction."""
         asset, quote = order.symbol.split("/")
 
         if order.execution_type == OrderExecutionType.market:
@@ -261,6 +297,9 @@ class Orders:
         return order
 
     def validate_order_before_creating(self, order: Order):  # noqa: PLR0912
+        """Raises if the order is invalid: unknown symbol, a limit/stoploss price on the
+        wrong side of the current market price, insufficient spot balance, or (futures)
+        a reduce_only order with no matching position or insufficient margin/fee balance."""
         if order.symbol not in self.exchange.market.current:
             raise ValueError(
                 f"Symbol {order.symbol} is not currently available. Cannot create an order!"
@@ -310,9 +349,7 @@ class Orders:
                     symbol=order.symbol
                 )
                 required_side = (
-                    PositionSide.long
-                    if order.side == OrderSide.sell
-                    else PositionSide.short
+                    PositionSide.long if order.side == OrderSide.sell else PositionSide.short
                 )
                 if existing_position is None:
                     raise ValueError(
@@ -324,9 +361,7 @@ class Orders:
                         f"got {existing_position.side}, expected {required_side}"
                     )
                 elif existing_position.volume < order.volume:
-                    raise ValueError(
-                        "reduce_only order volume exceeds existing position volume"
-                    )
+                    raise ValueError("reduce_only order volume exceeds existing position volume")
 
             required_margin = self.exchange.positions.calculate_required_margin(
                 symbol=order.symbol,
@@ -348,6 +383,11 @@ class Orders:
                     )
 
     def refresh_order(self, order: Order) -> Order:  # noqa: PLR0912, PLR0915
+        """Checks whether `order` should fill against the current candle (always true
+        for market orders; for limit/stoploss, whether the candle's high/low crossed the
+        trigger price) and, if so, executes it: moves spot balances or opens/adjusts a
+        futures position, deducts fees, marks the order closed, and cancels its OCO
+        partner if any."""
         if order.status == OrderStatus.open:
             should_execute = False
 
@@ -459,6 +499,7 @@ class Orders:
                 order.status = OrderStatus.closed
                 order.close_time = self.exchange.market.current["time_close"].to_pydatetime()
                 order = self.update_order(order=order)
+                self._emit_order_filled(order)
 
                 if order.is_oco and order.oco_reference is not None:
                     oco_order = self.get_order_by_id(id=order.oco_reference)
@@ -467,6 +508,9 @@ class Orders:
         return order
 
     def refresh_open_orders(self) -> None:
+        """Re-checks every open limit/stoploss order against the current candle,
+        stoploss orders first (so a stop-out is never masked by an optimistic same-tick
+        take-profit fill)."""
         # process stoploss first to avoid optimistic results
         open_orders = self.get_orders(status=OrderStatus.open)
         for order in open_orders:
@@ -477,5 +521,53 @@ class Orders:
                 self.refresh_order(order=order)
 
     def cancel_open_orders(self) -> None:
+        """Cancels every currently-open order."""
         for order in self.get_orders(status=OrderStatus.open):
             self.cancel_order(order=order)
+
+    # ------------------------------------------------------------------
+    # Event log emission
+    # ------------------------------------------------------------------
+
+    def _emit_order_created(self, order: Order) -> None:
+        """Records an OrderCreated event for the exchange's audit trail."""
+        self.exchange.event_log.emit(
+            OrderCreated(
+                time=order.open_time,
+                order_id=order.id,
+                symbol=order.symbol,
+                side=order.side,
+                execution_type=order.execution_type,
+                volume=order.volume,
+                price=order.price,
+            )
+        )
+
+    def _emit_order_filled(self, order: Order) -> None:
+        """Records an OrderFilled event for the exchange's audit trail."""
+        assert order.close_time is not None
+        self.exchange.event_log.emit(
+            OrderFilled(
+                time=order.close_time,
+                order_id=order.id,
+                symbol=order.symbol,
+                side=order.side,
+                execution_type=order.execution_type,
+                volume=order.volume,
+                price=order.price_with_slippage,
+                fees_asset=order.fees_asset,
+                fees_volume=order.fees_volume,
+            )
+        )
+
+    def _emit_order_canceled(self, order: Order) -> None:
+        """Records an OrderCanceled event for the exchange's audit trail."""
+        self.exchange.event_log.emit(
+            OrderCanceled(
+                time=self.exchange.market.current["time_close"].to_pydatetime(),
+                order_id=order.id,
+                symbol=order.symbol,
+                side=order.side,
+                execution_type=order.execution_type,
+            )
+        )

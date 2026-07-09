@@ -105,9 +105,7 @@ def make_report_figure(  # noqa: PLR0913
         trades_df["close_reason"] = trades_df["close_reason"].apply(
             lambda x: x.value if x is not None else ""
         )
-        trades_df["result"] = trades_df["result"].apply(
-            lambda x: x.value if x is not None else ""
-        )
+        trades_df["result"] = trades_df["result"].apply(lambda x: x.value if x is not None else "")
         trades_df["time_open"] = trades_df["time_open"].apply(
             lambda x: x.strftime("%Y-%m-%d %H:%M") if x is not None else ""
         )
@@ -126,9 +124,7 @@ def make_report_figure(  # noqa: PLR0913
             header=dict(values=list(trades_df.columns) if not trades_df.empty else []),
             cells=dict(
                 values=(
-                    [trades_df[c].values for c in trades_df.columns]
-                    if not trades_df.empty
-                    else []
+                    [trades_df[c].values for c in trades_df.columns] if not trades_df.empty else []
                 )
             ),
         ),
@@ -141,9 +137,7 @@ def make_report_figure(  # noqa: PLR0913
         fig.add_trace(
             go.Table(
                 header=dict(values=list(additional_fields.columns)),
-                cells=dict(
-                    values=[additional_fields[c].values for c in additional_fields.columns]
-                ),
+                cells=dict(values=[additional_fields[c].values for c in additional_fields.columns]),
             ),
             row=5,
             col=1,

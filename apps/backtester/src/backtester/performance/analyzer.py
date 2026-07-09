@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from backtester.exchange import Exchange
+from backtester.exchange.event_log import EventLog
 from backtester.market import Market
 from backtester.performance import metrics
 from backtester.performance.charts import make_report_figure
@@ -16,6 +17,10 @@ from backtester.strategies import Trade
 
 
 class PerformanceAnalyzer:
+    """Collects a per-candle equity/exposure snapshot over the course of a backtest,
+    then computes returns, drawdown, and a full set of risk/trade metrics against those
+    snapshots and the strategy's trade history."""
+
     def __init__(  # noqa: PLR0913
         self,
         market: Market,
@@ -25,6 +30,9 @@ class PerformanceAnalyzer:
         key: str = "algo",
         risk_free_rate: float = 0.0,
     ):
+        """`exchange`/`portfolio` are optional so a merge_reports() target can be built
+        without either (it only needs pre-computed snapshots/trades from other
+        analyzers)."""
         self.exchange = exchange
         self.portfolio = portfolio
         self.market = market
@@ -35,13 +43,29 @@ class PerformanceAnalyzer:
 
         self.raw_snapshots: dict[pd.Timestamp, dict] = {}
         self.merged: pd.DataFrame | None = None
+
         self.summary: dict[str, dict[str, float]] = {}
+        # Populated only by merge_reports() -- timestamps present in one source
+        # analyzer's snapshots but missing from at least one other, and therefore
+        # silently skipped by merge_external_snapshots rather than summed in.
+        self.skipped_timestamps: list[pd.Timestamp] = []
+
+    @property
+    def event_log(self) -> EventLog | None:
+        """The exchange's structured audit trail, if this analyzer has a live exchange
+        reference -- recording is owned by Exchange (it's the source of the state
+        changes), this just gives reports/tests a natural place to reach it from."""
+        return self.exchange.event_log if self.exchange else None
 
     # ------------------------------------------------------------------
     # Snapshot collection
     # ------------------------------------------------------------------
 
     def take_snapshot(self) -> None:
+        """Records one raw_snapshots entry for the current candle: total balance,
+        net balance (excluding deposits/withdrawals that tick), and exchange/portfolio
+        exposure. Called once per tick by Backtester.run_step(); no-ops without a live
+        exchange/current candle."""
         if self.exchange is None or self.exchange.market.current is None:
             return
 
@@ -87,15 +111,18 @@ class PerformanceAnalyzer:
             transactions = self.exchange.transactions.get_transactions_by_timestamp(timestamp=ts)
             if transactions:
                 deposits = sum(t["value_in_usd"] for t in transactions if t["type"] == "deposit")
-                withdrawals = sum(
-                    t["value_in_usd"] for t in transactions if t["type"] != "deposit"
-                )
+                withdrawals = sum(t["value_in_usd"] for t in transactions if t["type"] != "deposit")
                 snapshot["transactions"] = deposits - withdrawals
 
         snapshot["net_balance"] = snapshot["balance"] - snapshot["transactions"]
         self.raw_snapshots[ts] = snapshot
 
     def merge_external_snapshots(self, snapshots: list[dict[pd.Timestamp, dict]]) -> None:
+        """Sums balance/exposure across multiple independent backtests' raw_snapshots at
+        each shared timestamp, replacing self.raw_snapshots with the combined result.
+        Timestamps missing from any one source are silently skipped for that
+        contribution (see merge_reports's _find_skipped_timestamps for surfacing which
+        ones)."""
         if not snapshots:
             return
         snaps = copy.deepcopy(snapshots)
@@ -130,6 +157,8 @@ class PerformanceAnalyzer:
     # ------------------------------------------------------------------
 
     def _build_algo_df(self) -> pd.DataFrame:
+        """Resamples raw_snapshots to daily frequency and derives simple/log/cumulative
+        returns and drawdown from net_balance."""
         algo_df = (
             pd.DataFrame(list(self.raw_snapshots.values()))
             .assign(ts=lambda x: x["ts"])
@@ -165,6 +194,8 @@ class PerformanceAnalyzer:
         )
 
     def _build_symbol_df(self, symbol: str) -> pd.DataFrame:
+        """Resamples `symbol`'s own OHLC to daily frequency and derives the same
+        returns/drawdown series as _build_algo_df, for use as a buy-and-hold benchmark."""
         symbol_df = (
             self.market.get_market(symbol)
             .assign(ts=lambda x: x["time_close"])
@@ -187,6 +218,9 @@ class PerformanceAnalyzer:
         )
 
     def _build_merged_df(self) -> pd.DataFrame | None:
+        """Builds self.merged: a daily-frequency DataFrame combining the algo's own
+        returns/exposure series (prefixed by `self.key`) with each benchmark symbol's
+        buy-and-hold returns series (prefixed by the symbol)."""
         if self.market.merged is None:
             return None
 
@@ -231,6 +265,10 @@ class PerformanceAnalyzer:
     # ------------------------------------------------------------------
 
     def generate_report(self) -> dict[str, dict[str, float]] | None:
+        """Builds self.merged and populates self.summary with the full metric set
+        (Sharpe, Sortino, CAGR, drawdown, profit factor, win rate, ...) for the algo and
+        each benchmark symbol. Returns None (leaving summary unset) if there's no data
+        to report on."""
         self._build_merged_df()
 
         if self.merged is None or self.merged.shape[0] == 0:
@@ -293,11 +331,14 @@ class PerformanceAnalyzer:
     # ------------------------------------------------------------------
 
     def show_plot(self, additional_fields: pd.DataFrame | None = None) -> None:
+        """Opens the report chart in a browser (no-op if generate_report() hasn't run)."""
         fig = self._make_figure(additional_fields)
         if fig is not None:
             fig.show()
 
     def save_plot(self, filename: str, additional_fields: pd.DataFrame | None = None) -> None:
+        """Writes the report chart to `filename` as HTML (raises on an empty filename;
+        no-op if generate_report() hasn't run)."""
         if not filename:
             raise ValueError("filename must not be empty")
         fig = self._make_figure(additional_fields)
@@ -305,6 +346,8 @@ class PerformanceAnalyzer:
             fig.write_html(filename)
 
     def _make_figure(self, additional_fields: pd.DataFrame | None = None):
+        """Builds the Plotly report figure from self.merged/summary/trades, or None if
+        there's no merged data yet."""
         if self.merged is None:
             return None
         return make_report_figure(
@@ -323,16 +366,62 @@ class PerformanceAnalyzer:
     def save_report_plot(
         self, filename: str, additional_fields: pd.DataFrame | None = None
     ) -> None:
+        """Deprecated alias for save_plot()."""
         self.save_plot(filename, additional_fields)
 
     def show_report_plot(self, additional_fields: pd.DataFrame | None = None) -> None:
+        """Deprecated alias for show_plot()."""
         self.show_plot(additional_fields)
 
     def generate_algo_report_dataframe(self) -> pd.DataFrame:
+        """Public wrapper around _build_algo_df()."""
         return self._build_algo_df()
 
     def generate_symbol_report_dataframe(self, symbol: str) -> pd.DataFrame:
+        """Public wrapper around _build_symbol_df()."""
         return self._build_symbol_df(symbol)
 
     def generate_merged_report_dataframe(self) -> pd.DataFrame | None:
+        """Public wrapper around _build_merged_df()."""
         return self._build_merged_df()
+
+
+def _find_skipped_timestamps(snapshots: list[dict[pd.Timestamp, dict]]) -> list[pd.Timestamp]:
+    """Timestamps present in the first snapshot dict but missing from at least one of the
+    others -- mirrors merge_external_snapshots's own `if ts not in snap: continue` skip
+    condition, so callers can see exactly which timestamps didn't get summed into every
+    source rather than being silently dropped from the combined result."""
+    if not snapshots:
+        return []
+    base_timestamps = set(snapshots[0].keys())
+    skipped: set[pd.Timestamp] = set()
+    for snapshot in snapshots[1:]:
+        skipped |= base_timestamps - set(snapshot.keys())
+    return sorted(skipped)
+
+
+def merge_reports(
+    analyzers: list[PerformanceAnalyzer], key: str = "combined"
+) -> PerformanceAnalyzer:
+    """Runs N independent backtests' `PerformanceAnalyzer`s through the same
+    fetch-snapshots / concat-trades / generate-report dance the legacy notebook's
+    `Reporter.merge_external_snapshots()` pattern required doing by hand, in one call.
+    Each `analyzer` should already have `generate_report()` called on it (i.e. its
+    source backtest already completed) -- this only reads `raw_snapshots`/`trades` off
+    each, it doesn't run anything.
+    """
+    if not analyzers:
+        raise ValueError("merge_reports requires at least one analyzer")
+
+    first = analyzers[0]
+    merged = PerformanceAnalyzer(
+        market=first.market,
+        benchmark_symbols=first.benchmark_symbols,
+        key=key,
+        risk_free_rate=first.risk_free_rate,
+    )
+    merged.merge_external_snapshots([a.raw_snapshots for a in analyzers])
+    merged.trades = [trade for a in analyzers for trade in a.trades]
+    merged.skipped_timestamps = _find_skipped_timestamps([a.raw_snapshots for a in analyzers])
+    merged.generate_report()
+    return merged

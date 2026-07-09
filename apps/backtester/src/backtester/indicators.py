@@ -262,6 +262,9 @@ class Indicators:
 
 
 class IndicatorUtils:
+    """Date/length bookkeeping for indicators: how far back a warmup window needs to
+    start so an indicator has enough history to be valid by `date_from`."""
+
     @staticmethod
     def subtract_from_date(
         date_from: str, unit_of_time: UnitOfTime, unit_of_time_length: int

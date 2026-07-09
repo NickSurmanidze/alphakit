@@ -25,6 +25,9 @@ class TradeResult(Enum):
 
 
 class AllocationPosition:
+    """A desired position within a Strategy's Allocation: side, symbol, and target size
+    as a percent of portfolio value (volume is filled in later by the rebalancer)."""
+
     def __init__(
         self,
         side: PositionSide,
@@ -32,6 +35,8 @@ class AllocationPosition:
         percent: float,
         average_open_price: float,
     ):
+        """volume starts at 0 -- the rebalancer computes it from `percent` and the
+        current price."""
         self.side: PositionSide = side
         self.symbol: str = symbol
         self.percent: float = percent
@@ -40,6 +45,9 @@ class AllocationPosition:
 
 
 class AllocationOrder:
+    """A desired standing order (typically TP/SL) within a Strategy's Allocation --
+    volume is filled in later by the rebalancer, same as AllocationPosition."""
+
     def __init__(
         self,
         side: OrderSide,
@@ -48,6 +56,8 @@ class AllocationOrder:
         price: float,
         execution_type: OrderExecutionType,
     ):
+        """volume starts at 0 -- the rebalancer computes it from `percent` and the
+        current price."""
         self.side: OrderSide = side
         self.symbol: str = symbol
         self.percent: float = percent
@@ -57,7 +67,11 @@ class AllocationOrder:
 
 
 class Allocation:
+    """A strategy's (or portfolio's merged) desired target state: which positions to
+    hold and which standing orders (TP/SL) to have open."""
+
     def __init__(self):
+        """Starts empty -- flat, no orders."""
         self.positions: list[AllocationPosition] = []
         self.orders: list[AllocationOrder] = []
 
@@ -69,7 +83,13 @@ class StrategyDirection(Enum):
 
 
 class Trade:
+    """A completed round-trip trade record: open/close price and time, why it closed,
+    and its percent PnL (slippage/fee-free -- see Positions.reduce_position_volume's
+    realized_pnl_in_usd for the actual exchange-fill-based PnL)."""
+
     def __init__(self):
+        """Starts as an empty/default trade -- Strategy.open_trade()/close_trade() fill
+        it in."""
         self.symbol: str = ""
         self.side: PositionSide = PositionSide.long
         self.time_open: pd.Timestamp | None = None
@@ -90,6 +110,7 @@ class Strategy(ABC):
     """
 
     def __init__(self, key: str, market: Market, symbol: str):
+        """Starts flat (empty Allocation, no trade history)."""
         self.key: str = key
         self.allocation: Allocation = Allocation()
         self.market: Market = market
@@ -108,12 +129,16 @@ class Strategy(ABC):
     # ------------------------------------------------------------------
 
     def open_trade(self, side: PositionSide, open_price: float) -> None:
+        """Starts tracking a new current_trade at the given side/price/time."""
         self.current_trade.side = side
         self.current_trade.symbol = self.symbol
         self.current_trade.time_open = self.market.current["time_close"]
         self.current_trade.open_price = open_price
 
     def close_trade(self, close_price: float, reason: CloseReason) -> None:
+        """Finalizes current_trade: records close price/time/reason/holding period,
+        computes its percent PnL and winner/loser result, appends a copy to
+        trade_history, and resets current_trade to a fresh empty Trade."""
         self.current_trade.time_close = self.market.current["time_close"]
         self.current_trade.close_price = close_price
         self.current_trade.close_reason = reason
@@ -136,4 +161,7 @@ class Strategy(ABC):
         self.current_trade = Trade()
 
     def _mark_allocation_changed(self) -> None:
+        """Stamps allocation_change_time with the current candle's close time -- this is
+        what Portfolio's change-detection hash (and thus Rebalancer.rebalance()) reacts
+        to, so subclasses must call this whenever they mutate self.allocation."""
         self.allocation_change_time = self.market.current["time_close"].to_pydatetime()

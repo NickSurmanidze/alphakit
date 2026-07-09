@@ -41,8 +41,10 @@ EXCHANGE_PARAMS: dict[str, ExchangeConfig] = {
 
 
 def get_exchange_params(exchange_key: str = "default") -> ExchangeFees:
+    """Looks up the fee/slippage preset for `exchange_key` (raises KeyError if unknown)."""
     return EXCHANGE_PARAMS[exchange_key]["params"]
 
 
 def get_exchange_name(exchange_key: str = "default") -> str:
+    """Looks up the display name for `exchange_key` (raises KeyError if unknown)."""
     return EXCHANGE_PARAMS[exchange_key]["name"]

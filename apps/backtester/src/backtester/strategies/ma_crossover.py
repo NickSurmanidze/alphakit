@@ -13,6 +13,9 @@ from backtester.strategies.base import (
 
 
 class MaCrossoverStrategy(Strategy):
+    """Enters long/short when a fast moving-average indicator crosses a slow one, and
+    exits on the reverse cross, a take-profit fill, or a stop-loss fill."""
+
     def __init__(  # noqa: PLR0913
         self,
         key: str,
@@ -26,6 +29,9 @@ class MaCrossoverStrategy(Strategy):
         sl_enabled: bool = True,
         tp_enabled: bool = True,
     ):
+        """direction controls which crosses are actually traded (long-only,
+        short-only, or both); tp_percent/sl_percent are fractional distances from entry
+        price."""
         super().__init__(key, market, symbol)
         self.direction: StrategyDirection = direction
         self.slow_indicator_key: str = slow_indicator_key
@@ -42,6 +48,11 @@ class MaCrossoverStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def refresh(self) -> None:
+        """Compares this candle's fast/slow indicator values against the previous
+        candle's to detect a cross; on a cross, exits any current position and enters
+        the new direction (if enabled). Otherwise checks SL/TP against the current
+        candle's high/low. No-ops on the first candle or while indicators are still
+        warming up (falsy values)."""
         candle_num = self.market.current["num"]
         if candle_num == 0:
             return
@@ -92,6 +103,8 @@ class MaCrossoverStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _check_long_sl_tp(self, price: float) -> None:  # noqa: ARG002
+        """Exits the current long position if this candle's low hit the stop-loss or
+        its high hit the take-profit (no-op if not currently long)."""
         if not self.allocation.positions:
             return
         if self.allocation.positions[0].side != PositionSide.long:
@@ -103,6 +116,8 @@ class MaCrossoverStrategy(Strategy):
             self._exit_current(self.tp_price, CloseReason.tp)
 
     def _check_short_sl_tp(self, price: float) -> None:  # noqa: ARG002
+        """Exits the current short position if this candle's high hit the stop-loss or
+        its low hit the take-profit (no-op if not currently short)."""
         if not self.allocation.positions:
             return
         if self.allocation.positions[0].side != PositionSide.short:
@@ -118,6 +133,8 @@ class MaCrossoverStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _exit_current(self, price: float, reason: CloseReason) -> None:
+        """Flattens the allocation (no-op if already flat) and records the close on the
+        current trade."""
         if not self.allocation.positions:
             return
         self.allocation = Allocation()
@@ -125,14 +142,14 @@ class MaCrossoverStrategy(Strategy):
         self.close_trade(close_price=price, reason=reason)
 
     def _enter(self, side: PositionSide, price: float) -> None:
+        """Sets the allocation to a full-size position on `side` plus its TP/SL orders
+        (if enabled), and starts tracking a new trade."""
         tp_order = self._make_tp_order(side, price)
         sl_order = self._make_sl_order(side, price)
 
         self.allocation = Allocation()
         self.allocation.positions = [
-            AllocationPosition(
-                side=side, symbol=self.symbol, percent=1, average_open_price=price
-            )
+            AllocationPosition(side=side, symbol=self.symbol, percent=1, average_open_price=price)
         ]
         if tp_order:
             self.allocation.orders.append(tp_order)
@@ -142,6 +159,8 @@ class MaCrossoverStrategy(Strategy):
         self.open_trade(side=side, open_price=price)
 
     def _make_tp_order(self, side: PositionSide, price: float) -> AllocationOrder | None:
+        """Builds the take-profit limit order for a new `side` position at `price`, or
+        None if take-profit is disabled."""
         if not self.tp_enabled:
             return None
         order_side = OrderSide.sell if side == PositionSide.long else OrderSide.buy
@@ -154,6 +173,8 @@ class MaCrossoverStrategy(Strategy):
         )
 
     def _make_sl_order(self, side: PositionSide, price: float) -> AllocationOrder | None:  # noqa: ARG002
+        """Builds the stop-loss stoploss-limit order for a new `side` position at
+        `price`, or None if stop-loss is disabled."""
         if not self.sl_enabled:
             return None
         order_side = OrderSide.sell if side == PositionSide.long else OrderSide.buy

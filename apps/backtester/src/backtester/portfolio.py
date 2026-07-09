@@ -14,13 +14,21 @@ _LongOrders = dict[str, list[AllocationOrder]]
 
 
 class WeightedStrategy:
+    """Pairs a Strategy with the weight its allocation should be scaled by when merged
+    into a Portfolio."""
+
     def __init__(self, weight: float, strategy: Strategy):
         self.weight: float = weight
         self.strategy: Strategy = strategy
 
 
 class Portfolio:
+    """Aggregates one or more WeightedStrategy allocations into a single merged
+    allocation, netting long vs. short exposure to the same symbol across strategies."""
+
     def __init__(self, weighted_strategies: list[WeightedStrategy], output_scale: float = 1):
+        """output_scale multiplies every strategy's weighted allocation uniformly, e.g.
+        to run the whole portfolio at half size."""
         self.weighted_strategies: list[WeightedStrategy] = weighted_strategies
         self.output_scale: float = output_scale
 
@@ -35,6 +43,9 @@ class Portfolio:
     # ------------------------------------------------------------------
 
     def merge_allocation(self) -> None:
+        """Recomputes `self.merged_allocation` from every weighted strategy's own
+        allocation, netting opposite-side positions on the same symbol (see
+        _net_positions)."""
         long_pos, long_ord = self._collect_sides(PositionSide.long, OrderSide.sell)
         short_pos, short_ord = self._collect_sides(PositionSide.short, OrderSide.buy)
         merged_pos, merged_ord = self._net_positions(long_pos, long_ord, short_pos, short_ord)
@@ -47,6 +58,8 @@ class Portfolio:
         self.merged_allocation = allocation
 
     def refresh_exposures(self) -> None:
+        """Recomputes `self.exposure` (long/short/gross/net, as fractions of the
+        portfolio) from the current `merged_allocation`."""
         self.exposure = {"long": 0.0, "short": 0.0, "gross": 0.0, "net": 0.0}
         for position in self.merged_allocation.positions:
             if position.side == PositionSide.long:
@@ -57,6 +70,8 @@ class Portfolio:
         self.exposure["net"] = abs(self.exposure["short"] - self.exposure["long"])
 
     def refresh(self) -> None:
+        """Refreshes every strategy, then re-merges the allocation and exposures only if
+        any strategy's allocation actually changed this tick (cheap no-op otherwise)."""
         for ws in self.weighted_strategies:
             ws.strategy.refresh()
 
@@ -142,6 +157,8 @@ class Portfolio:
         return merged_pos, merged_ord
 
     def _get_signal_allocation_change_time_hash(self) -> str:
+        """Hashes every strategy's last allocation-change timestamp -- used by refresh()
+        to detect "did anything actually change" without a deep comparison."""
         times = "".join(
             ws.strategy.allocation_change_time.isoformat()
             for ws in self.weighted_strategies

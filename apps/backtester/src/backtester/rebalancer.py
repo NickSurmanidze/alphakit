@@ -12,21 +12,27 @@ from backtester.portfolio import Portfolio
 
 
 class Rebalancer:
+    """Reconciles the exchange's actual open positions/orders against the portfolio's
+    merged target allocation whenever that allocation changes."""
+
     def __init__(self, market: Market, exchange: Exchange, portfolio: Portfolio):
+        """Snapshots the portfolio's current allocation hash so the first refresh() only
+        rebalances if the allocation has changed since construction."""
         self.rebalancing_plan: list[Order] = []
 
         self.market: Market = market
         self.exchange: Exchange = exchange
         self.portfolio: Portfolio = portfolio
         # tracks the last-seen allocation hash to detect changes
-        self.signal_allocation_change_time_hash = (
-            self.portfolio.signal_allocation_change_time_hash
-        )
+        self.signal_allocation_change_time_hash = self.portfolio.signal_allocation_change_time_hash
 
     def get_allocation(self):
+        """Returns the portfolio's current merged target allocation."""
         return self.portfolio.merged_allocation
 
     def refresh(self):
+        """Triggers rebalance() only if the portfolio's allocation hash has changed
+        since the last refresh (no-op otherwise, or if there are no strategies at all)."""
         if len(self.portfolio.weighted_strategies) == 0:
             return
 
@@ -40,6 +46,10 @@ class Rebalancer:
             )
 
     def rebalance(self):
+        """Cancels all open orders, sizes the target allocation's positions/orders in
+        volume terms, closes positions no longer in the target, opens/increases/reduces
+        positions to match target sizes, re-creates TP/SL orders, and logs the resulting
+        exposure."""
         self.exchange.orders.cancel_open_orders()
 
         total_balance = self.exchange.get_asset_total_in_usd()

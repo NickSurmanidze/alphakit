@@ -2,15 +2,23 @@ import pandas as pd
 
 
 class MarketDataFromCSV:
+    """Loads OHLCV data from a CSV file, resamples it to the requested interval, and
+    filters it to a date range -- the standard way this package's tests/notebooks feed
+    real historical data into a Market."""
+
     def __init__(  # noqa: PLR0913
         self, symbol: str, date_from: str, date_to: str, interval: int, unit_of_time: str, path: str
     ) -> None:
+        """Eagerly loads and processes the CSV at `path` via fetch_ohlc()."""
         self.data = self.fetch_ohlc(symbol, date_from, date_to, interval, unit_of_time, path)
 
     @staticmethod
     def fetch_ohlc(  # noqa: PLR0913
         symbol: str, date_from: str, date_to: str, interval: int, unit_of_time: str, path: str
     ):
+        """Reads the CSV, resamples to `interval`/`unit_of_time` buckets (open=first,
+        high=max, low=min, close=last, volume=sum), and returns only rows within
+        [date_from, date_to), indexed by bucket close time."""
         df = pd.read_csv(path)
 
         # check if Volume column exists - TradingView csv has it with capital V
@@ -63,12 +71,19 @@ class MarketDataFromCSV:
         return df
 
     def get_df(self):
+        """Returns the loaded/resampled OHLCV DataFrame."""
         return self.data
 
 
 # market contains all symbols and technical indicators
 class Market:
+    """Holds every symbol's OHLC DataFrame and indicator Series, then compiles them into
+    a flat dict (`self.data`, keyed by close timestamp) for O(1) per-candle lookup during
+    the backtest loop. `self.current` is the live candle dict every other module reads
+    each step."""
+
     def __init__(self):
+        """Starts with no markets/indicators loaded and no current candle set."""
         # main storage
         self.markets = dict()
         self.indicators = dict()
@@ -87,10 +102,13 @@ class Market:
 
     # will add a dataframe with market ohlc
     def add_market(self, symbol: str, df: pd.DataFrame):
+        """Registers `df` as the OHLC data for `symbol`. Call compile() afterwards to
+        rebuild the flat per-candle lookup."""
         self.markets[symbol] = df
         return self.markets
 
     def get_market(self, symbol: str) -> pd.DataFrame:
+        """Returns the raw OHLC DataFrame for `symbol` (raises if not registered)."""
         if symbol not in self.markets:
             raise ValueError(f"Market with symbol {symbol} not found")
 
@@ -110,38 +128,53 @@ class Market:
         indicator_name: str,
         df: pd.DataFrame | pd.Series,
     ):
+        """Registers an indicator Series/DataFrame under a composite key so it can be
+        merged alongside the matching symbol's OHLC data in compile()."""
         key = f"{symbol}__{interval}__{unit_of_time}__{indicator_name}"
         self.indicators[key] = df
         return self.indicators
 
     # adds technical indicator to the store
     def get_indicator(self, symbol: str, interval: int, unit_of_time: str, indicator_name: str):
+        """Looks up a previously-registered indicator by its composite key."""
         key = f"{symbol}__{interval}__{unit_of_time}__{indicator_name}"
         return self.indicators[key]
 
     def set_current_market_from_num_index(self, num: int):
+        """Sets `self.current` to the candle at sequential position `num`."""
         self.current = self.data[self.index_num_ts[num]]
         return self.current
 
     def set_current_market_from_ts_index(self, ts: pd.Timestamp):
+        """Sets `self.current` to the candle whose close timestamp is `ts`."""
         self.current = self.data[ts]
         return self.current
 
     def get_market_by_ts(self, ts: pd.Timestamp):
+        """Returns the candle dict at close timestamp `ts` without changing `self.current`."""
         return self.data[ts]
 
     def get_market_by_num(self, num: int):
+        """Returns the candle dict at sequential position `num` without changing
+        `self.current`."""
         return self.data[self.index_num_ts[num]]
 
     def set_next_candle_as_current_market(self):
+        """Advances `self.current` to the next candle in sequence -- the core "tick
+        forward" operation the backtest loop calls every step."""
         self.set_current_market_from_num_index(num=self.current["num"] + 1)
         return self.current
 
     def reset(self):
+        """Rewinds `self.current` back to the first compiled candle."""
         self.set_current_market_from_num_index(num=0)
 
     # merges all market OHLC dataframes and indicators into self.merged
     def merge(self) -> pd.DataFrame:
+        """Combines every registered symbol's OHLC columns and every registered
+        indicator into one wide DataFrame (`self.merged`), forward-filled and numbered
+        sequentially -- the intermediate step before compile() flattens it into
+        per-candle dicts."""
         # Step 1: first we merge all markets
         # ohlc columns will have symbol as a prefix e.g. BTC/USD_open etc.
         symbols = list(self.markets.keys())
@@ -179,14 +212,19 @@ class Market:
 
     # compile raw markets into the consolidated full markets dict
     def compile(self):
+        """Builds `self.data`, a dict keyed by close timestamp of plain-Python candle
+        dicts (one per symbol, each with its OHLC fields and nested indicator values),
+        by flattening `self.merged` (calling merge() first if needed). This is what
+        makes each backtest step an O(1) dict lookup instead of a DataFrame slice.
+        Also resets `self.current` to the first candle."""
         if self.merged is None:
             self.merge()
 
         if self.merged is None:
             return None
 
-        _M_PARTS = 3       # m__symbol__title
-        _IND_SIMPLE = 5    # i__symbol__interval__unit__name
+        _M_PARTS = 3  # m__symbol__title
+        _IND_SIMPLE = 5  # i__symbol__interval__unit__name
         _IND_SUBFIELD = 6  # i__symbol__interval__unit__name__subfield
 
         # Pre-classify columns once so the inner loop does no string parsing.
