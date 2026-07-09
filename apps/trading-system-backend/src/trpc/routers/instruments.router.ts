@@ -2,20 +2,28 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import { getConnector } from '../../connectors/registry.js';
-import { deleteAllCandles } from '../../modules/candles/candleStore.js';
+import { deleteAllCandles, deleteCandlesForResolution, getLatestCloses } from '../../modules/candles/candleStore.js';
 import {
+  addInstrumentResolution,
   createInstrument,
   deleteInstrument,
   getInstrumentById,
   instrumentExists,
   listInstruments,
-  updateInstrumentBaseResolution,
-  updateInstrumentCoverage,
-  updateInstrumentFlags
+  resetInstrumentResolution,
+  updateInstrumentDescription,
+  updateInstrumentFlags,
+  updateResolutionCoverage
 } from '../../modules/instruments/instruments.repository.js';
-import { BaseResolution, InstrumentSource, toPublicInstrument } from '../../modules/instruments/instruments.types.js';
+import {
+  BaseResolution,
+  finestResolution,
+  InstrumentSource,
+  toPublicInstrument
+} from '../../modules/instruments/instruments.types.js';
+import { BACKFILL_JOB_OPTS } from '../../queue/queue-utils.js';
 import { addQueueJob } from '../../queue/queues.js';
-import { QueueJobNames, Queues } from '../../queue/types.js';
+import { historicalQueueFor, liveQueueFor, QueueJobNames } from '../../queue/types.js';
 import { protectedProcedure, router } from '../trpc.js';
 
 /** Looks up the earliest date the source actually has data for a symbol *at one resolution* --
@@ -37,17 +45,58 @@ const lookupEarliestAvailableDate = async (
   }
 };
 
+/** Marks one resolution `inProgress` and enqueues its historical backfill job -- shared by fresh
+ * registration, `resetResolution`, and `addResolution` so all three compute `from` the same way:
+ * full history since the source's earliest known date if requested and known, else a fixed
+ * trailing window. */
+const startBackfill = async (params: {
+  instrumentId: string;
+  source: InstrumentSource;
+  resolution: BaseResolution;
+  earliestAvailableDate: Date | null;
+  backfillDays: number;
+  backfillFullHistory: boolean;
+}): Promise<void> => {
+  const { instrumentId, source, resolution, earliestAvailableDate, backfillDays, backfillFullHistory } = params;
+  const to = new Date();
+  const from =
+    backfillFullHistory && earliestAvailableDate
+      ? earliestAvailableDate
+      : new Date(to.getTime() - backfillDays * 24 * 60 * 60_000);
+
+  await updateResolutionCoverage(instrumentId, resolution, { status: 'inProgress' });
+  await addQueueJob({
+    queueName: historicalQueueFor(source),
+    job: {
+      name: QueueJobNames.backfillHistoricalCandles,
+      data: { instrumentId, resolution, from: from.toISOString(), to: to.toISOString() },
+      opts: BACKFILL_JOB_OPTS
+    }
+  });
+};
+
 const DEFAULT_BACKFILL_DAYS = 30;
 
-const sourceSchema = z.enum(['binance', 'yahoo']);
+const sourceSchema = z.enum(['binance', 'yahoo', 'ib']);
 const assetClassSchema = z.enum(['spot', 'perpetual', 'equity', 'future', 'index', 'forex']);
-const baseResolutionSchema = z.enum(['1_minute', '1_hour', '1_day']);
-const DEFAULT_BASE_RESOLUTION = '1_hour';
+const baseResolutionSchema = z.enum(['1_minute', '5_minute', '1_hour', '1_day']);
+const DEFAULT_RESOLUTIONS: BaseResolution[] = ['1_hour'];
 
 export const instrumentsRouter = router({
   list: protectedProcedure.query(async () => {
     const instruments = await listInstruments();
-    return instruments.map(toPublicInstrument);
+    // Skip instruments with no collected resolutions yet (finestResolution throws on that) --
+    // shouldn't happen for anything registered through this router, but a list endpoint
+    // shouldn't fail entirely over one bad row's missing price either.
+    const latestCloses = await getLatestCloses(
+      instruments
+        .filter(doc => Object.keys(doc.collectedResolutions).length > 0)
+        .map(doc => ({ instrumentId: doc._id.toHexString(), resolution: finestResolution(doc) }))
+    );
+    return instruments.map(doc => ({
+      ...toPublicInstrument(doc),
+      latestPrice: latestCloses.get(doc._id.toHexString()) ?? null
+    }));
   }),
 
   searchSymbols: protectedProcedure
@@ -61,9 +110,13 @@ export const instrumentsRouter = router({
         assetClass: assetClassSchema,
         sourceSymbol: z.string().min(1),
         displaySymbol: z.string().min(1),
+        description: z.string().optional(),
         baseCurrency: z.string().optional(),
         quoteCurrency: z.string().optional(),
-        baseResolution: baseResolutionSchema.default(DEFAULT_BASE_RESOLUTION),
+        // Every resolution to explicitly collect for this instrument, e.g. ['5_minute', '1_day']
+        // for an IB future where daily depth vastly exceeds intraday depth and deriving one from
+        // the other would be wrong in either direction.
+        resolutions: z.array(baseResolutionSchema).min(1).default(DEFAULT_RESOLUTIONS),
         calendarVenue: z.string().min(1),
         cacheHistoricalPrices: z.boolean().default(true),
         cacheLivePrices: z.boolean().default(true),
@@ -82,37 +135,34 @@ export const instrumentsRouter = router({
         });
       }
 
-      const { backfillDays, backfillFullHistory, ...instrumentInput } = input;
-      const earliest = await lookupEarliestAvailableDate(input.source, input.sourceSymbol, input.baseResolution);
-      const earliestAvailableDates: Partial<Record<BaseResolution, Date>> = earliest
-        ? { [input.baseResolution]: earliest }
-        : {};
-      const instrument = await createInstrument({ ...instrumentInput, earliestAvailableDates });
-      const instrumentId = instrument._id.toHexString();
+      const { resolutions, backfillDays, backfillFullHistory, ...instrumentInput } = input;
 
-      const to = new Date();
-      let from = new Date(to.getTime() - backfillDays * 24 * 60 * 60_000);
-
-      if (backfillFullHistory && earliest) {
-        from = earliest;
-        // If the source couldn't tell us, silently fall back to the backfillDays window
-        // computed above rather than failing the whole registration.
+      const earliestDates = new Map<BaseResolution, Date | null>();
+      for (const resolution of resolutions) {
+        earliestDates.set(resolution, await lookupEarliestAvailableDate(input.source, input.sourceSymbol, resolution));
       }
 
-      await updateInstrumentCoverage(instrumentId, { status: 'inProgress' });
-      await addQueueJob({
-        queueName: Queues.MARKET_DATA_HISTORICAL,
-        job: {
-          name: QueueJobNames.backfillHistoricalCandles,
-          data: {
-            instrumentId,
-            from: from.toISOString(),
-            to: to.toISOString()
-          }
-        }
+      const instrument = await createInstrument({
+        ...instrumentInput,
+        resolutions: Object.fromEntries(
+          resolutions.map(resolution => [resolution, { earliestAvailableDate: earliestDates.get(resolution) ?? null }])
+        )
       });
+      const instrumentId = instrument._id.toHexString();
 
-      return toPublicInstrument(instrument);
+      for (const resolution of resolutions) {
+        await startBackfill({
+          instrumentId,
+          source: input.source,
+          resolution,
+          earliestAvailableDate: earliestDates.get(resolution) ?? null,
+          backfillDays,
+          backfillFullHistory
+        });
+      }
+
+      const created = await getInstrumentById(instrumentId);
+      return created ? toPublicInstrument(created) : toPublicInstrument(instrument);
     }),
 
   updateFlags: protectedProcedure
@@ -130,6 +180,14 @@ export const instrumentsRouter = router({
       return instrument ? toPublicInstrument(instrument) : null;
     }),
 
+  updateDescription: protectedProcedure
+    .input(z.object({ id: z.string(), description: z.string() }))
+    .mutation(async ({ input }) => {
+      await updateInstrumentDescription(input.id, input.description);
+      const instrument = await getInstrumentById(input.id);
+      return instrument ? toPublicInstrument(instrument) : null;
+    }),
+
   delete: protectedProcedure.input(z.object({ id: z.string() })).mutation(async ({ input }) => {
     // Candle data first: if the instrument doc were deleted first and this failed partway
     // through, the rows would become permanently unreachable (no instrument to look up their
@@ -139,40 +197,71 @@ export const instrumentsRouter = router({
     return { success: true };
   }),
 
-  updateResolution: protectedProcedure
-    .input(z.object({ id: z.string(), baseResolution: baseResolutionSchema }))
+  /** Wipes and re-backfills just one of an instrument's already-collected resolutions -- e.g.
+   * after fixing a connector bug, or to force a clean re-download. Leaves every other collected
+   * resolution (and anything derived from them) untouched. Replaces the old whole-instrument
+   * `updateResolution`, which used to wipe *all* candle data because there was only ever one
+   * resolution to wipe. */
+  resetResolution: protectedProcedure
+    .input(z.object({ id: z.string(), resolution: baseResolutionSchema }))
     .mutation(async ({ input }) => {
       const instrument = await getInstrumentById(input.id);
       if (!instrument) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Instrument not found' });
       }
-      if (instrument.baseResolution === input.baseResolution) {
+      const coverage = instrument.collectedResolutions[input.resolution];
+      if (!coverage) {
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message: `Instrument does not collect ${input.resolution}`
+        });
+      }
+
+      await deleteCandlesForResolution(input.id, input.resolution);
+      await resetInstrumentResolution(input.id, input.resolution);
+      await startBackfill({
+        instrumentId: input.id,
+        source: instrument.source,
+        resolution: input.resolution,
+        earliestAvailableDate: coverage.earliestAvailableDate,
+        backfillDays: DEFAULT_BACKFILL_DAYS,
+        backfillFullHistory: coverage.earliestAvailableDate !== null
+      });
+
+      const updated = await getInstrumentById(input.id);
+      return updated ? toPublicInstrument(updated) : null;
+    }),
+
+  /** Starts collecting a new resolution on an already-registered instrument (e.g. adding
+   * '5_minute' to an IB future that started out daily-only), without touching its existing
+   * collected resolutions. */
+  addResolution: protectedProcedure
+    .input(
+      z.object({ id: z.string(), resolution: baseResolutionSchema, backfillFullHistory: z.boolean().default(false) })
+    )
+    .mutation(async ({ input }) => {
+      const instrument = await getInstrumentById(input.id);
+      if (!instrument) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Instrument not found' });
+      }
+      if (instrument.collectedResolutions[input.resolution]) {
         return toPublicInstrument(instrument);
       }
 
-      // Resolve the new range *before* deleting anything: if the connector lookup throws (e.g.
-      // a network blip), we bail out here with the instrument's existing data still intact,
-      // instead of wiping it and only then discovering we can't say what to re-backfill.
-      let earliest = instrument.earliestAvailableDates?.[input.baseResolution] ?? null;
-      if (!earliest) {
-        earliest = await lookupEarliestAvailableDate(instrument.source, instrument.sourceSymbol, input.baseResolution);
-      }
+      const earliestAvailableDate = await lookupEarliestAvailableDate(
+        instrument.source,
+        instrument.sourceSymbol,
+        input.resolution
+      );
 
-      // A different base resolution has a completely different set of rows at every derived
-      // resolution too (e.g. switching 1_day -> 1_minute means the old daily-derived rows were
-      // built from daily source data, not minute data) -- wipe everything and re-derive from
-      // scratch rather than trying to reconcile old and new.
-      await deleteAllCandles(input.id);
-      await updateInstrumentBaseResolution(input.id, input.baseResolution, earliest);
-
-      const to = new Date();
-      const from = earliest ?? new Date(to.getTime() - DEFAULT_BACKFILL_DAYS * 24 * 60 * 60_000);
-      await addQueueJob({
-        queueName: Queues.MARKET_DATA_HISTORICAL,
-        job: {
-          name: QueueJobNames.backfillHistoricalCandles,
-          data: { instrumentId: input.id, from: from.toISOString(), to: to.toISOString() }
-        }
+      await addInstrumentResolution(input.id, input.resolution, earliestAvailableDate);
+      await startBackfill({
+        instrumentId: input.id,
+        source: instrument.source,
+        resolution: input.resolution,
+        earliestAvailableDate,
+        backfillDays: DEFAULT_BACKFILL_DAYS,
+        backfillFullHistory: input.backfillFullHistory
       });
 
       const updated = await getInstrumentById(input.id);
@@ -185,10 +274,13 @@ export const instrumentsRouter = router({
       throw new TRPCError({ code: 'NOT_FOUND', message: 'Instrument not found' });
     }
 
-    await addQueueJob({
-      queueName: Queues.MARKET_DATA_LIVE,
-      job: { name: QueueJobNames.refreshLatestCandles, data: { instrumentId: input.id } }
-    });
+    const queueName = liveQueueFor(instrument.source);
+    for (const resolution of Object.keys(instrument.collectedResolutions) as BaseResolution[]) {
+      await addQueueJob({
+        queueName,
+        job: { name: QueueJobNames.refreshLatestCandles, data: { instrumentId: input.id, resolution } }
+      });
+    }
     return { success: true };
   })
 });

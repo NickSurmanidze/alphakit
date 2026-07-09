@@ -1,13 +1,15 @@
 import { BaseResolution } from '../instruments/instruments.types.js';
 
-// All resolutions we store, finest to coarsest. BaseResolution ('1_minute' | '1_hour' | '1_day')
-// is the set a connector can hand us raw data at; the full set below is what we store/serve.
-export type Resolution = '1_minute' | '15_minute' | '1_hour' | '1_day';
+// All resolutions we store, finest to coarsest. BaseResolution ('1_minute' | '5_minute' |
+// '1_hour' | '1_day') is the set a connector can hand us raw data at; the full set below is what
+// we store/serve.
+export type Resolution = '1_minute' | '5_minute' | '15_minute' | '1_hour' | '1_day';
 
-export const RESOLUTION_ORDER: Resolution[] = ['1_minute', '15_minute', '1_hour', '1_day'];
+export const RESOLUTION_ORDER: Resolution[] = ['1_minute', '5_minute', '15_minute', '1_hour', '1_day'];
 
 export const RESOLUTION_MS: Record<Resolution, number> = {
   '1_minute': 60_000,
+  '5_minute': 5 * 60_000,
   '15_minute': 15 * 60_000,
   '1_hour': 60 * 60_000,
   '1_day': 24 * 60 * 60_000
@@ -15,6 +17,7 @@ export const RESOLUTION_MS: Record<Resolution, number> = {
 
 export const RESOLUTION_TO_PG_INTERVAL: Record<Resolution, string> = {
   '1_minute': '1 minute',
+  '5_minute': '5 minutes',
   '15_minute': '15 minutes',
   '1_hour': '1 hour',
   '1_day': '1 day'
@@ -34,6 +37,7 @@ export const candlesTableName = (resolution: Resolution): string => `candles__${
  */
 export const GAP_CHECK_LOOKBACK_DAYS: Record<BaseResolution, number> = {
   '1_minute': 7,
+  '5_minute': 14,
   '1_hour': 90,
   '1_day': 3650
 };
@@ -42,6 +46,28 @@ export const GAP_CHECK_LOOKBACK_DAYS: Record<BaseResolution, number> = {
 export const coarserResolutionsThan = (from: BaseResolution | Resolution): Resolution[] => {
   const idx = RESOLUTION_ORDER.indexOf(from as Resolution);
   return idx === -1 ? [] : RESOLUTION_ORDER.slice(idx + 1);
+};
+
+/**
+ * Resolutions to derive from `sourceResolution` after writing raw data at it, bounded by the
+ * instrument's other explicitly-collected resolutions: an instrument that collects both
+ * '5_minute' and '1_day' directly (e.g. IB, where daily depth vastly exceeds intraday depth)
+ * should derive '15_minute'/'1_hour' from '5_minute' but must NOT overwrite '1_day' with a
+ * derived bucket -- the directly-collected '1_day' rows (which reach much further back) win.
+ * Same rule generalizes today's single-baseResolution instruments (Binance/Yahoo): with only one
+ * collected resolution, this is identical to `coarserResolutionsThan`.
+ */
+export const resolutionsToDerive = (
+  sourceResolution: BaseResolution | Resolution,
+  collectedResolutions: (BaseResolution | Resolution)[]
+): Resolution[] => {
+  const collected = new Set<Resolution>(collectedResolutions as Resolution[]);
+  const targets: Resolution[] = [];
+  for (const candidate of coarserResolutionsThan(sourceResolution)) {
+    if (collected.has(candidate)) break;
+    targets.push(candidate);
+  }
+  return targets;
 };
 
 /** Floors `date` down to the start of its bucket at `resolution` (top of the hour, start of the

@@ -14,24 +14,43 @@ const defaultWorkerOptions = {
   removeOnFail: { age: 30 * 24 * 3600 }
 };
 
+// IB's own in-process rate limiter (connectors/ib/rateLimiter.ts) serializes every call to
+// ~1/10s regardless of concurrency here -- concurrency above a handful buys nothing but extra
+// BullMQ locks held on jobs that are just parked waiting their turn in that shared queue.
+// Binance/Yahoo have no such shared bottleneck (Yahoo's own limiter allows ~2/s), so their
+// workers can run considerably more jobs in parallel.
+const IB_LOCK_DURATION_MS = 120_000;
+
+interface WorkerSpec {
+  queue: Queues;
+  concurrency: number;
+  lockDuration?: number;
+}
+
+const WORKER_SPECS: WorkerSpec[] = [
+  { queue: Queues.MARKET_DATA_LIVE_BINANCE, concurrency: 10 },
+  { queue: Queues.MARKET_DATA_LIVE_YAHOO, concurrency: 10 },
+  { queue: Queues.MARKET_DATA_LIVE_IB, concurrency: 5, lockDuration: IB_LOCK_DURATION_MS },
+  { queue: Queues.MARKET_DATA_HISTORICAL_BINANCE, concurrency: 10 },
+  { queue: Queues.MARKET_DATA_HISTORICAL_YAHOO, concurrency: 10 },
+  { queue: Queues.MARKET_DATA_HISTORICAL_IB, concurrency: 3, lockDuration: IB_LOCK_DURATION_MS },
+  { queue: Queues.MARKET_DATA_GAPS_BINANCE, concurrency: 2 },
+  { queue: Queues.MARKET_DATA_GAPS_YAHOO, concurrency: 2 },
+  { queue: Queues.MARKET_DATA_GAPS_IB, concurrency: 2 }
+];
+
 // Returns the created workers so the caller can close them as part of one coordinated shutdown
 // sequence (see shutdown.ts) -- closing them here via our own SIGTERM handler raced with, and
 // duplicated, the shutdown logic index.ts also needs to run for the HTTP server and DB clients.
 export const startQueueWorkers = (): Worker[] => {
-  const workers: Worker[] = [
-    new Worker(Queues.MARKET_DATA_LIVE, job => processJob(job), {
-      ...defaultWorkerOptions,
-      concurrency: 10
-    }),
-    new Worker(Queues.MARKET_DATA_HISTORICAL, job => processJob(job), {
-      ...defaultWorkerOptions,
-      concurrency: 2
-    }),
-    new Worker(Queues.MARKET_DATA_GAPS, job => processJob(job), {
-      ...defaultWorkerOptions,
-      concurrency: 2
-    })
-  ];
+  const workers = WORKER_SPECS.map(
+    ({ queue, concurrency, lockDuration }) =>
+      new Worker(queue, job => processJob(job), {
+        ...defaultWorkerOptions,
+        concurrency,
+        ...(lockDuration ? { lockDuration } : {})
+      })
+  );
 
   for (const worker of workers) {
     worker.on('failed', handleJobError);

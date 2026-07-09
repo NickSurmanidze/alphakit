@@ -33,15 +33,30 @@ workspace (`pyproject.toml`, member: `apps/backtester`) with a single shared roo
 Express 5 + tRPC v11 + MongoDB (config/state) + TimescaleDB (OHLCV) + BullMQ + node-cron + Redis.
 
 - **Data model**: `instruments` (Mongo) hold source/symbol/resolution/coverage metadata;
-  `candles__{1_minute,15_minute,1_hour,1_day}` (TimescaleDB hypertables, one per resolution,
-  partitioned on `instrument_id`) hold OHLCV. An instrument has a `baseResolution` (what's
-  actually fetched from the source); everything coarser is derived in SQL from that base data.
-  `earliestAvailableDates` on the instrument doc caches the source's earliest data per resolution
-  (looked up lazily, only for resolutions actually used -- see gotchas).
+  `candles__{1_minute,5_minute,15_minute,1_hour,1_day}` (TimescaleDB hypertables, one per
+  resolution, partitioned on `instrument_id`) hold OHLCV. An instrument can explicitly collect more
+  than one resolution directly from its source at once (`collectedResolutions`, keyed by
+  resolution, each with its own `cacheFrom`/`cacheTo`/`status`/`earliestAvailableDate`) -- e.g. an
+  IB future collecting both `5_minute` and `1_day` directly, since IB's daily depth reaches
+  decades back while intraday depth is much shallower, and deriving one from the other would be
+  wrong in either direction. Resolutions strictly *between* two collected ones are still derived
+  in SQL (`resolutionsToDerive` in `modules/candles/resolutions.ts`, bounded so it stops before
+  overwriting the next collected resolution rather than assuming a single base). Existing
+  single-resolution instruments (Binance/Yahoo) work the same as before under this model -- they
+  just have one entry in `collectedResolutions`.
 - **Connectors** (`src/connectors/`): `MarketDataConnector` interface, implemented for `binance`
-  (public REST, no auth) and `yahoo` (unofficial `yahoo-finance2`, rate-limited, resolution
-  fallback for old intraday ranges). Adding a new source (Tradovate/IB planned) means implementing
-  this interface, not touching callers.
+  (public REST, no auth), `yahoo` (unofficial `yahoo-finance2`, rate-limited, resolution fallback
+  for old intraday ranges), and `ib` (Interactive Brokers, via `@stoqey/ib` against a dockerized
+  headless IB Gateway -- see `infra/docker-compose.yml`'s `ib-gateway` service and
+  `src/connectors/ib/client.ts`). IB futures are fetched via IB's native continuous-future
+  (`CONTFUT`) contract type rather than us stitching dated monthly/quarterly contracts ourselves;
+  `CONTFUT` rejects an explicit historical end date (IB error 10339), so `ibConnector` always
+  requests "N units of history ending now" and filters client-side for older ranges rather than
+  true backward pagination -- see the comment on `fetchHistoricalCandles` in `ibConnector.ts`
+  before changing its backfill logic. IB's own contract/exchange/security-type info is encoded
+  into the plain `symbol` string the connector interface hands around (`SYMBOL@EXCHANGE@SECTYPE`,
+  see `encodeSourceSymbol`/`parseSourceSymbol`), since the interface has no separate field for it.
+  Adding another new source means implementing `MarketDataConnector`, not touching callers.
 - **Jobs/scheduling** (`src/jobs/`, `src/queue/`, `src/cron/`): BullMQ queues
   (`MARKET_DATA_LIVE/HISTORICAL/GAPS`) processed by `queue/workers.ts`; node-cron in `cron/cron.ts`
   fans out per-instrument jobs every 1min (refresh) / 5min (gap-fill), guarded by a Redis lock
@@ -88,6 +103,7 @@ React 19 + React Router 7 + `@trpc/react-query` + Tailwind + shadcn/radix-ui + `
 make setup          # uv sync (backtester) + pnpm install
 make infra-up        # Mongo (27018) + Redis (63794) + TimescaleDB (5432) via docker compose
 pnpm --filter trading-system-backend migrate:timescale
+pnpm --filter trading-system-backend migrate:instruments   # one-time, only if instruments predate collectedResolutions
 pnpm --filter trading-system-backend seed:calendars
 pnpm --filter trading-system-backend seed:user -- --email <email> --password <password>
 make dev-backend      # tsx watch, http://localhost:4000
@@ -140,6 +156,20 @@ done. There's no CI wired up yet -- this is the only gate.
   looping over every resolution on every registration previously meant a resolution nobody asked
   for could fail the whole registration (e.g. Yahoo rejecting an old intraday range for "1 hour"
   when the user only wanted "1 day").
+- **IB Gateway needs real login credentials, not an API key.** `TWS_USERID`/`TWS_PASSWORD`/
+  `TRADING_MODE` in `apps/trading-system-backend/.env` are consumed directly by the `ib-gateway`
+  docker service (`infra/docker-compose.yml`'s `env_file`), not by app code -- named to match what
+  that image expects exactly, not this app's own `IB_*` env var convention. Don't reintroduce
+  `${...}` interpolation for these in `environment:`: Compose resolves that from *its own* project
+  `.env` (defaults to `infra/.env`, which doesn't exist), not from `env_file`, so it silently
+  resolves to blank -- `env_file` alone is what makes these reach the container, which is exactly
+  why the names have to match already. The backend itself only ever talks to the gateway's local
+  TWS API socket (`IB_GATEWAY_HOST`/`IB_GATEWAY_PORT`), never these three. The gateway restarts on
+  its own schedule and drops that socket briefly;
+  `IBApiNext`'s built-in `reconnectInterval` (set in `connectors/ib/client.ts`) handles reattaching
+  -- don't add a second manual reconnect loop on top of it. If 2FA (IBKR mobile push) is enabled
+  on the account, a (re)login can need one-time manual approval via the gateway's VNC port
+  (`localhost:5900`).
 - **Dev servers accumulate across sessions.** `tsx watch` / `vite` processes started with `&` or
   `nohup` don't get cleaned up automatically and will silently fight over ports 4000/5173 across
   multiple terminal sessions. Check `lsof -ti:4000,5173` and kill stragglers before starting new

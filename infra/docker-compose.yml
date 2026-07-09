@@ -46,6 +46,44 @@ services:
     networks:
       - alphakit-network
 
+  # Headless IB Gateway (community image: https://github.com/gnzsnz/ib-gateway-docker) -- wraps
+  # IBC (headless automation) + IB Gateway behind Xvfb so it can run without a desktop session.
+  # API ports ARE published to the host: unlike Mongo/Redis/Timescale, the backend itself is not
+  # dockerized (see `make dev-backend` -- plain `pnpm dev` on the host), so it needs to reach this
+  # over localhost, same as it does for the other three services. It restarts itself on a schedule
+  # (AUTO_RESTART_TIME), which briefly drops that socket -- the backend's IB connector
+  # auto-reconnects (see src/connectors/ib/client.ts) rather than us needing this to stay up
+  # without interruption. VNC is exposed to the host for one-time manual 2FA approval if IBKR
+  # mobile push interrupts a (re)login -- connect a VNC client to localhost:5900, not meant to
+  # stay open otherwise.
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: unless-stopped
+    # Reuses the backend's own .env for credentials rather than a second copy -- TWS_USERID/
+    # TWS_PASSWORD/TRADING_MODE live in apps/trading-system-backend/.env alongside every other
+    # secret this app needs, named to match what this image expects directly (no `${...}`
+    # interpolation here -- that's resolved by Compose itself from *its own* project .env, which
+    # defaults to infra/.env, not this one; env_file below injects the vars into the container
+    # as-is, so the names in .env have to already be the image's names).
+    env_file:
+      - ../apps/trading-system-backend/.env
+    environment:
+      - READ_ONLY_API=yes
+      - TWOFA_TIMEOUT_ACTION=restart
+      - TIME_ZONE=Etc/UTC
+    # IBGateway itself only ever listens on 127.0.0.1:4002 (paper) / 127.0.0.1:4001 (live) inside
+    # the container, regardless of TRADING_MODE -- this image's own `socat` process is what
+    # actually accepts external connections, relaying its *own* separate port (4004 paper / 4003
+    # live) to that internal loopback listener (see /home/ibgateway/scripts/run_socat.sh in the
+    # image). Publish the socat ports, not 4001/4002 -- those aren't reachable from outside the
+    # container at all, socat or not.
+    ports:
+      - "4004:4004" # paper API socket (via socat)
+      - "4003:4003" # live API socket (via socat, idle unless TRADING_MODE=live)
+      - "5900:5900" # VNC, for manual 2FA approval only
+    networks:
+      - alphakit-network
+
 volumes:
   mongo_data:
   redis_data:

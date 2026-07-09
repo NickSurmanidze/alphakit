@@ -1,7 +1,7 @@
 import { getCalendar } from '../tradingCalendars/tradingCalendars.repository.js';
 import { TradingCalendarDoc } from '../tradingCalendars/tradingCalendars.types.js';
 import { getCandles } from './candleStore.js';
-import { RESOLUTION_MS, Resolution } from './resolutions.js';
+import { floorToBucketStart, RESOLUTION_MS, Resolution } from './resolutions.js';
 
 const WEEKDAY_INDEX: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
 
@@ -41,7 +41,16 @@ export const computeExpectedTimes = (
 ): Date[] => {
   const stepMs = RESOLUTION_MS[resolution];
   const times: Date[] = [];
-  for (let t = from.getTime(); t < to.getTime(); t += stepMs) {
+  // `from` is frequently an arbitrary, sub-second-precision instant (e.g. `now - lookbackDays`,
+  // recomputed fresh on every gap-check tick) rather than something already on a bucket boundary
+  // -- stepping from it directly would build an expected-time grid that's offset from every real
+  // candle's actual (epoch-aligned) timestamp by that same arbitrary amount, so almost nothing
+  // would ever match and every real candle would misreport as "missing". Anchor the grid to the
+  // same bucket boundaries the rest of the system uses (deriveCoarserResolutions,
+  // refreshLatestCandles, ...) instead. Floors *down*, so the first bucket can start slightly
+  // before `from` -- harmless, `getCandles`'s own `from`/`to` bounds still apply to what's fetched.
+  const alignedFrom = floorToBucketStart(from, resolution).getTime();
+  for (let t = alignedFrom; t < to.getTime(); t += stepMs) {
     const date = new Date(t);
     if (isWithinSession(date, calendar)) {
       times.push(date);

@@ -11,6 +11,7 @@ import { trpc } from '@/lib/trpc';
 // trading days/year) returns fewer rows per calendar-day window than a 24/7 one like crypto.
 const CHUNK_BARS: Record<Resolution, number> = {
   '1_minute': 360,
+  '5_minute': 420,
   '15_minute': 480,
   '1_hour': 336,
   '1_day': 730

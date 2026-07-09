@@ -1,58 +1,21 @@
 import type { ReactNode } from 'react';
-import { NavLink, useLocation, useParams } from 'react-router-dom';
+import { LayoutDashboard, LineChart } from 'lucide-react';
+import { NavLink, useLocation } from 'react-router-dom';
 
+import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { Button } from '@/components/ui/button';
 import { useAuth } from '@/lib/auth';
 import { cn } from '@/lib/utils';
-import { trpc } from '@/lib/trpc';
 
 const navLinkClasses = ({ isActive }: { isActive: boolean }) =>
   cn(
-    'block rounded-md px-2 py-1.5 text-sm font-medium transition-colors hover:bg-muted hover:text-foreground',
+    'flex items-center gap-2 rounded-md px-2 py-1.5 text-sm font-medium transition-colors hover:bg-muted hover:text-foreground',
     isActive ? 'bg-muted text-foreground' : 'text-muted-foreground'
   );
-
-const childNavLinkClasses = ({ isActive }: { isActive: boolean }) =>
-  cn(
-    'block rounded-md px-2 py-1 text-sm transition-colors hover:bg-muted hover:text-foreground',
-    isActive ? 'bg-muted text-foreground' : 'text-muted-foreground'
-  );
-
-// The Instruments group's second-level nav: "List" always, plus the instrument currently being
-// viewed (if any) so the sidebar reflects where you actually are within that section, not just
-// that you're somewhere under it.
-const InstrumentsNavGroup = () => {
-  const location = useLocation();
-  const { id } = useParams<{ id: string }>();
-  const isUnderInstruments = location.pathname.startsWith('/instruments');
-  const viewingInstrumentId = location.pathname.startsWith('/instruments/') ? id : undefined;
-
-  // Cheap: trpc/react-query dedupes this against the same query already used by the list and
-  // detail pages, so this doesn't add a real extra request when either of those is also mounted.
-  const instruments = trpc.instruments.list.useQuery(undefined, { enabled: Boolean(viewingInstrumentId) });
-  const viewingInstrument = instruments.data?.find(i => i.id === viewingInstrumentId);
-
-  return (
-    <div className="flex flex-col gap-0.5">
-      <div className={cn('px-2 py-1.5 text-sm font-medium', isUnderInstruments ? 'text-foreground' : 'text-muted-foreground')}>
-        Instruments
-      </div>
-      <div className="ml-2 flex flex-col gap-0.5 border-l border-border pl-2">
-        <NavLink to="/instruments" end className={childNavLinkClasses}>
-          List
-        </NavLink>
-        {viewingInstrument ? (
-          <NavLink to={`/instruments/${viewingInstrument.id}`} className={childNavLinkClasses}>
-            {viewingInstrument.displaySymbol}
-          </NavLink>
-        ) : null}
-      </div>
-    </div>
-  );
-};
 
 export const DashboardLayout = ({ children }: { children: ReactNode }) => {
   const { logout } = useAuth();
+  const location = useLocation();
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -63,10 +26,14 @@ export const DashboardLayout = ({ children }: { children: ReactNode }) => {
         <nav className="flex-1 overflow-y-auto p-4">
           <div className="flex flex-col gap-1">
             <NavLink to="/" end className={navLinkClasses}>
+              <LayoutDashboard className="size-4" />
               Dashboard
             </NavLink>
 
-            <InstrumentsNavGroup />
+            <NavLink to="/instruments" className={navLinkClasses}>
+              <LineChart className="size-4" />
+              Instruments
+            </NavLink>
 
             {/* Opens in a new tab; auth is via the httpOnly refresh cookie, sent automatically --
                 no token to pass through a plain link. */}
@@ -89,7 +56,9 @@ export const DashboardLayout = ({ children }: { children: ReactNode }) => {
         </div>
       </aside>
 
-      <main className="flex-1 overflow-y-auto p-6">{children}</main>
+      <main className="flex-1 overflow-y-auto p-6">
+        <ErrorBoundary key={location.pathname}>{children}</ErrorBoundary>
+      </main>
     </div>
   );
 };

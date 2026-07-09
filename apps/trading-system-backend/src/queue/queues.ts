@@ -9,11 +9,9 @@ const defaultQueueOptions = {
   connection: redis()
 };
 
-export const queues: Record<Queues, Queue> = {
-  [Queues.MARKET_DATA_LIVE]: new Queue(Queues.MARKET_DATA_LIVE, defaultQueueOptions),
-  [Queues.MARKET_DATA_HISTORICAL]: new Queue(Queues.MARKET_DATA_HISTORICAL, defaultQueueOptions),
-  [Queues.MARKET_DATA_GAPS]: new Queue(Queues.MARKET_DATA_GAPS, defaultQueueOptions)
-};
+export const queues: Record<Queues, Queue> = Object.fromEntries(
+  Object.values(Queues).map(name => [name, new Queue(name, defaultQueueOptions)])
+) as Record<Queues, Queue>;
 
 export const addQueueJob = async ({ queueName, job }: { queueName: Queues; job: AllQueueJobs }) => {
   return queues[queueName].add(job.name, job.data, job.opts);

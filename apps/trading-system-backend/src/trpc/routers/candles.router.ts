@@ -4,7 +4,7 @@ import { subscribeToChannel } from '../../db/redis.js';
 import { getCandles } from '../../modules/candles/candleStore.js';
 import { protectedProcedure, router } from '../trpc.js';
 
-const resolutionSchema = z.enum(['1_minute', '15_minute', '1_hour', '1_day']);
+const resolutionSchema = z.enum(['1_minute', '5_minute', '15_minute', '1_hour', '1_day']);
 
 export const candlesRouter = router({
   getCandles: protectedProcedure

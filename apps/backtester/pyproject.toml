@@ -29,6 +29,7 @@ dependencies = [
   "structlog>=24.1",
   "SQLAlchemy>=2.0",
   "psycopg[binary]>=3.2",
+  "pymongo>=4.8",
   "python-dateutil>=2.9",
   "pandas-stubs>=2.3.0.250703",
   "plotly>=6.2.0",

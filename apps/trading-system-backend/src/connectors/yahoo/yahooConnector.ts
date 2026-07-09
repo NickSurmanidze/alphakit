@@ -7,8 +7,9 @@ import { yahooRateLimited } from './rateLimiter.js';
 
 const yahooFinance = new YahooFinanceClient();
 
-const RESOLUTION_TO_INTERVAL: Record<BaseResolution, '1m' | '1h' | '1d'> = {
+const RESOLUTION_TO_INTERVAL: Record<BaseResolution, '1m' | '5m' | '1h' | '1d'> = {
   '1_minute': '1m',
+  '5_minute': '5m',
   '1_hour': '1h',
   '1_day': '1d'
 };
@@ -16,7 +17,7 @@ const RESOLUTION_TO_INTERVAL: Record<BaseResolution, '1m' | '1h' | '1d'> = {
 // Finest-first; fetchHistoricalCandles falls back one step coarser each time Yahoo rejects
 // the range at the current resolution (its intraday history depth is limited and can change
 // without notice -- better to react to an actual failure than hardcode a day-count threshold).
-const FALLBACK_ORDER: BaseResolution[] = ['1_minute', '1_hour', '1_day'];
+const FALLBACK_ORDER: BaseResolution[] = ['1_minute', '5_minute', '1_hour', '1_day'];
 const nextCoarserResolution = (resolution: BaseResolution): BaseResolution | null => {
   const idx = FALLBACK_ORDER.indexOf(resolution);
   return idx < FALLBACK_ORDER.length - 1 ? FALLBACK_ORDER[idx + 1] : null;
@@ -25,12 +26,14 @@ const nextCoarserResolution = (resolution: BaseResolution): BaseResolution | nul
 // Yahoo's documented (and undocumented-but-observed) intraday depth limits, used only as a
 // fallback window when a full-range request at that resolution is rejected outright -- we still
 // prefer to read back whatever Yahoo actually returns over trusting these numbers exactly.
-// Deliberately shaved a few days under the documented cap (730 for 1h, ~8 for 1m): a request for
-// *exactly* 730 days was observed to still be rejected ("must be within the last 730 days"),
-// likely because Yahoo's own clock/rounding puts the boundary a little earlier than ours -- the
-// margin here is cheap insurance against that, not a real depth difference.
+// Deliberately shaved a few days under the documented cap (730 for 1h, 60 for 5m, ~8 for 1m): a
+// request for *exactly* the documented cap was observed to still be rejected for 1h ("must be
+// within the last 730 days"), likely because Yahoo's own clock/rounding puts the boundary a
+// little earlier than ours -- the margin here is cheap insurance against that, not a real depth
+// difference.
 const FALLBACK_LOOKBACK_MS: Partial<Record<BaseResolution, number>> = {
   '1_minute': 7 * 24 * 60 * 60 * 1000,
+  '5_minute': 58 * 24 * 60 * 60 * 1000,
   '1_hour': 725 * 24 * 60 * 60 * 1000
 };
 

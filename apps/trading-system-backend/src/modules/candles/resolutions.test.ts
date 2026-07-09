@@ -4,6 +4,7 @@ import {
   candlesTableName,
   coarserResolutionsThan,
   floorToBucketStart,
+  resolutionsToDerive,
   RESOLUTION_MS,
   RESOLUTION_ORDER
 } from './resolutions.js';
@@ -17,9 +18,26 @@ describe('candlesTableName', () => {
 
 describe('coarserResolutionsThan', () => {
   it('returns every resolution strictly coarser than the given one, in order', () => {
-    expect(coarserResolutionsThan('1_minute')).toEqual(['15_minute', '1_hour', '1_day']);
+    expect(coarserResolutionsThan('1_minute')).toEqual(['5_minute', '15_minute', '1_hour', '1_day']);
     expect(coarserResolutionsThan('15_minute')).toEqual(['1_hour', '1_day']);
     expect(coarserResolutionsThan('1_day')).toEqual([]);
+  });
+});
+
+describe('resolutionsToDerive', () => {
+  it('matches coarserResolutionsThan when only one resolution is collected', () => {
+    expect(resolutionsToDerive('1_minute', ['1_minute'])).toEqual(['5_minute', '15_minute', '1_hour', '1_day']);
+  });
+
+  it('stops before the next explicitly-collected resolution', () => {
+    // An instrument collecting both '5_minute' and '1_day' directly (e.g. an IB future) should
+    // derive '15_minute'/'1_hour' from '5_minute', but never overwrite the directly-collected
+    // '1_day' rows with a derived bucket.
+    expect(resolutionsToDerive('5_minute', ['5_minute', '1_day'])).toEqual(['15_minute', '1_hour']);
+  });
+
+  it('derives nothing past the coarsest collected resolution', () => {
+    expect(resolutionsToDerive('1_day', ['5_minute', '1_day'])).toEqual([]);
   });
 });
 

@@ -30,6 +30,21 @@ const toCandlestickData = (c: Candle): CandlestickData => ({
   close: c.close
 });
 
+// lightweight-charts throws an uncaught exception (crashing the whole page, since nothing here
+// catches it) if `setData` ever receives rows that aren't strictly ascending by time. The
+// intended data flow (see useCandleHistory) always prepends strictly-older chunks, so this
+// shouldn't normally be needed -- but sorting + deduping defensively here means a data-layer edge
+// case (e.g. two overlapping fetches racing, a resolution with sparse/gappy source coverage)
+// degrades to "a chart that's momentarily slightly off" instead of "a blank white page".
+const toSortedCandlestickData = (data: Candle[]): CandlestickData[] => {
+  const byTime = new Map<number, CandlestickData>();
+  for (const c of data) {
+    const point = toCandlestickData(c);
+    byTime.set(point.time as number, point);
+  }
+  return [...byTime.values()].sort((a, b) => (a.time as number) - (b.time as number));
+};
+
 export const CandlestickChart = ({
   data,
   liveCandle,
@@ -108,19 +123,21 @@ export const CandlestickChart = ({
       return;
     }
 
+    const sorted = toSortedCandlestickData(data);
+
     // First data this chart instance has ever seen -- fit the whole thing into view. Every
     // subsequent update (within this mount) is older bars prepended by scroll-back loading, so
     // instead of re-fitting (which would yank the user back to showing everything), shift the
     // visible logical range by however many bars were just added to the front, keeping the same
     // bars on screen.
     if (!hasFitInitialDataRef.current) {
-      seriesRef.current.setData(data.map(toCandlestickData));
+      seriesRef.current.setData(sorted);
       chartRef.current?.timeScale().fitContent();
       hasFitInitialDataRef.current = true;
     } else {
-      const addedBars = data.length - prevDataLengthRef.current;
+      const addedBars = sorted.length - prevDataLengthRef.current;
       const priorRange = chartRef.current?.timeScale().getVisibleLogicalRange() ?? null;
-      seriesRef.current.setData(data.map(toCandlestickData));
+      seriesRef.current.setData(sorted);
       if (priorRange && addedBars > 0) {
         chartRef.current?.timeScale().setVisibleLogicalRange({
           from: priorRange.from + addedBars,
@@ -128,7 +145,7 @@ export const CandlestickChart = ({
         });
       }
     }
-    prevDataLengthRef.current = data.length;
+    prevDataLengthRef.current = sorted.length;
   }, [data]);
 
   useEffect(() => {

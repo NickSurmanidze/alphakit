@@ -2,10 +2,10 @@ import { timescale } from '../../db/timescale.js';
 import { Candle } from '../../connectors/types.js';
 import {
   candlesTableName,
-  coarserResolutionsThan,
   RESOLUTION_ORDER,
   RESOLUTION_TO_PG_INTERVAL,
-  Resolution
+  Resolution,
+  resolutionsToDerive
 } from './resolutions.js';
 
 const UPSERT_BATCH_SIZE = 500;
@@ -102,22 +102,61 @@ export const getCandles = async (params: {
   }));
 };
 
+/** Latest close per instrument, at each instrument's own resolution -- batched by resolution (one
+ * query per distinct resolution requested, not one per instrument) via `DISTINCT ON`, for the
+ * instrument list view where showing a price for dozens of instruments as N individual queries
+ * would be wasteful. Instruments with no candles yet (still backfilling) are simply absent from
+ * the returned map rather than erroring. */
+export const getLatestCloses = async (
+  requests: { instrumentId: string; resolution: Resolution }[]
+): Promise<Map<string, number>> => {
+  const instrumentIdsByResolution = new Map<Resolution, string[]>();
+  for (const { instrumentId, resolution } of requests) {
+    const list = instrumentIdsByResolution.get(resolution) ?? [];
+    list.push(instrumentId);
+    instrumentIdsByResolution.set(resolution, list);
+  }
+
+  const result = new Map<string, number>();
+  for (const [resolution, instrumentIds] of instrumentIdsByResolution) {
+    const table = candlesTableName(resolution);
+    const rows = await timescale().query(
+      `SELECT DISTINCT ON (instrument_id) instrument_id, close
+       FROM ${table}
+       WHERE instrument_id = ANY($1)
+       ORDER BY instrument_id, ts DESC`,
+      [instrumentIds]
+    );
+    for (const row of rows.rows) {
+      result.set(row.instrument_id, Number(row.close));
+    }
+  }
+  return result;
+};
+
 /**
- * Aggregates `sourceResolution` data into every strictly coarser resolution, directly in SQL
- * (TimescaleDB's first()/last() hyperfunctions), for the given window. App-level derivation,
- * not a continuous aggregate -- matches the legacy system's approach, which avoided continuous
- * aggregates because they fight the upsert-heavy gap-correction pattern used here too.
+ * Aggregates `sourceResolution` data into every coarser resolution up to (but not including) the
+ * instrument's next explicitly-collected resolution, directly in SQL (TimescaleDB's
+ * first()/last() hyperfunctions), for the given window. App-level derivation, not a continuous
+ * aggregate -- matches the legacy system's approach, which avoided continuous aggregates because
+ * they fight the upsert-heavy gap-correction pattern used here too.
+ *
+ * `collectedResolutions` is the instrument's full set of directly-fetched resolutions (not just
+ * `sourceResolution`) -- an instrument collecting both '5_minute' and '1_day' directly must never
+ * have its directly-fetched '1_day' rows overwritten by a '5_minute'-derived bucket, since the
+ * derived version would be truncated to '5_minute's much shallower depth.
  */
 export const deriveCoarserResolutions = async (params: {
   instrumentId: string;
   sourceResolution: Resolution;
+  collectedResolutions: Resolution[];
   from: Date;
   to: Date;
 }): Promise<void> => {
-  const { instrumentId, sourceResolution, from, to } = params;
+  const { instrumentId, sourceResolution, collectedResolutions, from, to } = params;
   const sourceTable = candlesTableName(sourceResolution);
 
-  for (const target of coarserResolutionsThan(sourceResolution)) {
+  for (const target of resolutionsToDerive(sourceResolution, collectedResolutions)) {
     const targetTable = candlesTableName(target);
     const interval = RESOLUTION_TO_PG_INTERVAL[target];
 
@@ -146,7 +185,7 @@ export const deriveCoarserResolutions = async (params: {
   }
 };
 
-/** Deletes every candle row for `instrumentId` across all four resolution tables. Used when an
+/** Deletes every candle row for `instrumentId` across all resolution tables. Used when an
  * instrument is deleted -- otherwise its historical data becomes permanently orphaned in
  * TimescaleDB (unreachable once the Mongo instrument doc is gone, but never cleaned up). */
 export const deleteAllCandles = async (instrumentId: string): Promise<void> => {
@@ -155,4 +194,11 @@ export const deleteAllCandles = async (instrumentId: string): Promise<void> => {
       instrumentId
     ]);
   }
+};
+
+/** Deletes candle rows for `instrumentId` at just one resolution. Used to reset a single
+ * explicitly-collected resolution (see instruments.router.ts `resetResolution`) without touching
+ * the instrument's other collected resolutions or their derived tables. */
+export const deleteCandlesForResolution = async (instrumentId: string, resolution: Resolution): Promise<void> => {
+  await timescale().query(`DELETE FROM ${candlesTableName(resolution)} WHERE instrument_id = $1`, [instrumentId]);
 };

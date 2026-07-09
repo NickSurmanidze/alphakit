@@ -7,12 +7,14 @@ const MAX_KLINES_PER_CALL = 1000;
 
 const RESOLUTION_TO_INTERVAL: Record<BaseResolution, string> = {
   '1_minute': '1m',
+  '5_minute': '5m',
   '1_hour': '1h',
   '1_day': '1d'
 };
 
 const RESOLUTION_TO_MS: Record<BaseResolution, number> = {
   '1_minute': 60_000,
+  '5_minute': 5 * 60_000,
   '1_hour': 60 * 60_000,
   '1_day': 24 * 60 * 60_000
 };

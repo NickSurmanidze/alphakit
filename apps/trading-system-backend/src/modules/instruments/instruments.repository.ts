@@ -4,10 +4,13 @@ import { collection } from '../../db/mongo.js';
 import {
   AssetClass,
   BaseResolution,
+  FutureDetails,
   InstrumentDoc,
   InstrumentSource,
-  InstrumentStatus
+  InstrumentStatus,
+  ResolutionCoverage
 } from './instruments.types.js';
+import { pointValueFor } from './pointValues.js';
 
 const instruments = () => collection<InstrumentDoc>('instruments');
 
@@ -24,13 +27,17 @@ export const createInstrument = async (input: {
   assetClass: AssetClass;
   sourceSymbol: string;
   displaySymbol: string;
+  description?: string;
   baseCurrency?: string;
   quoteCurrency?: string;
-  baseResolution: BaseResolution;
   calendarVenue: string;
   cacheHistoricalPrices: boolean;
   cacheLivePrices: boolean;
-  earliestAvailableDates?: Partial<Record<BaseResolution, Date>>;
+  futureDetails?: FutureDetails;
+  // One coverage entry per resolution the instrument should start collecting, each pre-populated
+  // with whatever earliest-available lookup already ran (see instruments.router.ts) -- cache
+  // coverage itself always starts empty regardless, since nothing's been fetched yet.
+  resolutions: Partial<Record<BaseResolution, { earliestAvailableDate: Date | null }>>;
 }): Promise<InstrumentDoc> => {
   const existing = await (await instruments()).findOne({
     source: input.source,
@@ -40,13 +47,20 @@ export const createInstrument = async (input: {
     throw new Error(`Instrument ${input.source}:${input.sourceSymbol} already exists`);
   }
 
+  const { resolutions, ...rest } = input;
+  const collectedResolutions: Partial<Record<BaseResolution, ResolutionCoverage>> = Object.fromEntries(
+    Object.entries(resolutions).map(([resolution, { earliestAvailableDate }]) => [
+      resolution,
+      { cacheFrom: null, cacheTo: null, status: 'pending' as InstrumentStatus, earliestAvailableDate }
+    ])
+  );
+
   const now = new Date();
   const doc: InstrumentDoc = {
     _id: new ObjectId(),
-    ...input,
-    cacheFrom: null,
-    cacheTo: null,
-    status: 'pending',
+    ...rest,
+    collectedResolutions,
+    pointValue: pointValueFor(input.displaySymbol),
     createdAt: now,
     updatedAt: now
   };
@@ -67,14 +81,16 @@ export const listLiveInstruments = async (): Promise<InstrumentDoc[]> => {
   return (await instruments()).find({ cacheLivePrices: true }).toArray();
 };
 
-export const updateInstrumentCoverage = async (
+export const updateResolutionCoverage = async (
   id: string,
+  resolution: BaseResolution,
   updates: { cacheFrom?: Date; cacheTo?: Date; status?: InstrumentStatus }
 ): Promise<void> => {
-  await (await instruments()).updateOne(
-    { _id: new ObjectId(id) },
-    { $set: { ...updates, updatedAt: new Date() } }
-  );
+  const $set: Record<string, unknown> = { updatedAt: new Date() };
+  for (const [key, value] of Object.entries(updates)) {
+    $set[`collectedResolutions.${resolution}.${key}`] = value;
+  }
+  await (await instruments()).updateOne({ _id: new ObjectId(id) }, { $set });
 };
 
 export const updateInstrumentFlags = async (
@@ -87,29 +103,49 @@ export const updateInstrumentFlags = async (
   );
 };
 
+export const updateInstrumentDescription = async (id: string, description: string): Promise<void> => {
+  await (await instruments()).updateOne(
+    { _id: new ObjectId(id) },
+    { $set: { description, updatedAt: new Date() } }
+  );
+};
+
 export const deleteInstrument = async (id: string): Promise<void> => {
   await (await instruments()).deleteOne({ _id: new ObjectId(id) });
 };
 
-/** Changes an instrument's base resolution and resets its coverage back to `pending` -- the
- * caller is responsible for deleting the old candle rows and enqueuing a fresh backfill, since
- * those touch TimescaleDB/BullMQ rather than Mongo. */
-export const updateInstrumentBaseResolution = async (
+/** Resets one resolution's cache coverage back to `pending` -- the caller is responsible for
+ * deleting that resolution's candle rows and enqueueing a fresh backfill, since those touch
+ * TimescaleDB/BullMQ rather than Mongo. Keeps `earliestAvailableDate` (a source fact, not cache
+ * state) unless a fresh lookup value is supplied. */
+export const resetInstrumentResolution = async (
   id: string,
-  baseResolution: BaseResolution,
+  resolution: BaseResolution,
+  earliestAvailableDate?: Date | null
+): Promise<void> => {
+  const $set: Record<string, unknown> = {
+    [`collectedResolutions.${resolution}.cacheFrom`]: null,
+    [`collectedResolutions.${resolution}.cacheTo`]: null,
+    [`collectedResolutions.${resolution}.status`]: 'pending',
+    updatedAt: new Date()
+  };
+  if (earliestAvailableDate !== undefined) {
+    $set[`collectedResolutions.${resolution}.earliestAvailableDate`] = earliestAvailableDate;
+  }
+  await (await instruments()).updateOne({ _id: new ObjectId(id) }, { $set });
+};
+
+/** Adds a new resolution to an instrument's set of explicitly-collected resolutions (e.g. adding
+ * '5_minute' to an instrument that started out daily-only). No-op fields for cache coverage --
+ * the caller enqueues the actual backfill job separately. */
+export const addInstrumentResolution = async (
+  id: string,
+  resolution: BaseResolution,
   earliestAvailableDate: Date | null
 ): Promise<void> => {
+  const coverage: ResolutionCoverage = { cacheFrom: null, cacheTo: null, status: 'pending', earliestAvailableDate };
   await (await instruments()).updateOne(
     { _id: new ObjectId(id) },
-    {
-      $set: {
-        baseResolution,
-        cacheFrom: null,
-        cacheTo: null,
-        status: 'pending',
-        updatedAt: new Date(),
-        ...(earliestAvailableDate ? { [`earliestAvailableDates.${baseResolution}`]: earliestAvailableDate } : {})
-      }
-    }
+    { $set: { [`collectedResolutions.${resolution}`]: coverage, updatedAt: new Date() } }
   );
 };
