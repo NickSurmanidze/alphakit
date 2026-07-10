@@ -122,8 +122,12 @@ class Positions:
         """Opens a brand-new position at `price`/`volume`, locks its required margin,
         and records a PositionOpened event."""
         asset, quote = symbol.split("/")
-        value_in_usd = self.exchange.convert_asset_volume(volume, from_asset=asset, to_asset="USD")
-        cost_in_usd = price * volume
+        point_value = self.exchange.get_point_value(symbol)
+        value_in_usd = (
+            self.exchange.convert_asset_volume(volume, from_asset=asset, to_asset="USD")
+            * point_value
+        )
+        cost_in_usd = price * volume * point_value
 
         position = Position(
             id=str(uuid.uuid4()),
@@ -160,7 +164,8 @@ class Positions:
         its weighted-average entry price and margin, and records a PositionIncreased
         event."""
         asset, quote = position.symbol.split("/")
-        cost_in_usd = price * volume
+        point_value = self.exchange.get_point_value(position.symbol)
+        cost_in_usd = price * volume * point_value
 
         new_margin_used = position.margin_used_in_usd + cost_in_usd / self.exchange.max_leverage
         self.exchange.balance.unlock_balance(asset=quote, volume=position.margin_used_in_usd)
@@ -171,8 +176,11 @@ class Positions:
             position.average_entry_price * position.volume + price * volume
         ) / (position.volume + volume)
         position.volume = position.volume + volume
-        position.value_in_usd = self.exchange.convert_asset_volume(
-            volume=position.volume, from_asset=asset, to_asset="USD"
+        position.value_in_usd = (
+            self.exchange.convert_asset_volume(
+                volume=position.volume, from_asset=asset, to_asset="USD"
+            )
+            * point_value
         )
         position.collateral_used_in_usd = position.collateral_used_in_usd + cost_in_usd
 
@@ -204,6 +212,7 @@ class Positions:
             volume = position.volume
 
         asset, quote = position.symbol.split("/")
+        point_value = self.exchange.get_point_value(position.symbol)
 
         old_volume = position.volume
         new_volume = position.volume - volume
@@ -217,8 +226,9 @@ class Positions:
 
         position.margin_used_in_usd = new_margin_used
         position.volume = new_volume
-        position.value_in_usd = self.exchange.convert_asset_volume(
-            volume, from_asset=asset, to_asset="USD"
+        position.value_in_usd = (
+            self.exchange.convert_asset_volume(volume, from_asset=asset, to_asset="USD")
+            * point_value
         )
         position.collateral_used_in_usd = position.collateral_used_in_usd * (
             new_volume / old_volume
@@ -226,9 +236,9 @@ class Positions:
 
         pnl_in_usd: float = 0
         if position.side == PositionSide.long:
-            pnl_in_usd = volume * price - volume * position.average_entry_price
+            pnl_in_usd = point_value * (volume * price - volume * position.average_entry_price)
         else:
-            pnl_in_usd = volume * position.average_entry_price - volume * price
+            pnl_in_usd = point_value * (volume * position.average_entry_price - volume * price)
 
         if pnl_in_usd < 0:
             self.exchange.balance.reduce_asset_balance(asset=quote, volume=abs(pnl_in_usd))
@@ -288,7 +298,10 @@ class Positions:
                 else:
                     added_volume = volume - position.volume
 
-        return added_volume * price / self.exchange.max_leverage if added_volume else 0
+        point_value = self.exchange.get_point_value(symbol)
+        return (
+            added_volume * price * point_value / self.exchange.max_leverage if added_volume else 0
+        )
 
     def liquidate_position(self, position: Position):
         """Force-closes `position` for a total loss of its margin (not just the realized
@@ -332,20 +345,38 @@ class Positions:
         """Marks `position` to the current market price, recomputing its unrealized
         pnl_in_usd, and liquidates it if isolated margin has been exhausted (loss
         exceeds the position's own margin)."""
-        asset, quote = position.symbol.split("/")
-        position.value_in_usd = self.exchange.convert_asset_volume(
-            volume=position.volume, from_asset=asset, to_asset="USD"
-        )
-        price = position.value_in_usd / position.volume
+        point_value = self.exchange.get_point_value(position.symbol)
 
-        if position.side == PositionSide.long:
-            position.pnl_in_usd = (
-                position.volume * price - position.volume * position.average_entry_price
+        if point_value == 1.0:
+            # Crypto path, byte-for-byte unchanged: kept as its own branch (rather than
+            # folded into the point_value-aware math below via a "* 1.0") so the crypto
+            # path never depends on (a*b)/b round-tripping back to exactly `a`.
+            asset, quote = position.symbol.split("/")
+            position.value_in_usd = self.exchange.convert_asset_volume(
+                volume=position.volume, from_asset=asset, to_asset="USD"
             )
+            price = position.value_in_usd / position.volume
+
+            if position.side == PositionSide.long:
+                position.pnl_in_usd = (
+                    position.volume * price - position.volume * position.average_entry_price
+                )
+            else:
+                position.pnl_in_usd = (
+                    position.volume * position.average_entry_price - position.volume * price
+                )
         else:
-            position.pnl_in_usd = (
-                position.volume * position.average_entry_price - position.volume * price
-            )
+            market_price = self.exchange.get_market_price(position.symbol)
+            position.value_in_usd = position.volume * market_price * point_value
+
+            if position.side == PositionSide.long:
+                position.pnl_in_usd = (
+                    position.volume * point_value * (market_price - position.average_entry_price)
+                )
+            else:
+                position.pnl_in_usd = (
+                    position.volume * point_value * (position.average_entry_price - market_price)
+                )
 
         self.open_positions[position.symbol] = position
 

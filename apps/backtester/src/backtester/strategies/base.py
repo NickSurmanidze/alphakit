@@ -85,7 +85,9 @@ class StrategyDirection(Enum):
 class Trade:
     """A completed round-trip trade record: open/close price and time, why it closed,
     and its percent PnL (slippage/fee-free -- see Positions.reduce_position_volume's
-    realized_pnl_in_usd for the actual exchange-fill-based PnL)."""
+    realized_pnl_in_usd for the actual exchange-fill-based PnL). risk_percent, if the
+    strategy provided one, is the fractional distance originally risked (e.g. its
+    stop-loss distance) -- used to express pnl in R-multiples."""
 
     def __init__(self):
         """Starts as an empty/default trade -- Strategy.open_trade()/close_trade() fill
@@ -100,6 +102,7 @@ class Trade:
         self.pnl: float = 0
         self.result: TradeResult | None = None
         self.holding_period: pd.Timedelta | None = None
+        self.risk_percent: float | None = None
 
 
 class Strategy(ABC):
@@ -128,12 +131,18 @@ class Strategy(ABC):
     # Trade tracking helpers (concrete — shared by all subclasses)
     # ------------------------------------------------------------------
 
-    def open_trade(self, side: PositionSide, open_price: float) -> None:
-        """Starts tracking a new current_trade at the given side/price/time."""
+    def open_trade(
+        self, side: PositionSide, open_price: float, risk_percent: float | None = None
+    ) -> None:
+        """Starts tracking a new current_trade at the given side/price/time.
+        risk_percent, if given, is the fractional distance being risked (e.g. the
+        stop-loss distance as a percent of entry price) -- recorded so metrics can
+        later express this trade's PnL in R-multiples."""
         self.current_trade.side = side
         self.current_trade.symbol = self.symbol
         self.current_trade.time_open = self.market.current["time_close"]
         self.current_trade.open_price = open_price
+        self.current_trade.risk_percent = risk_percent
 
     def close_trade(self, close_price: float, reason: CloseReason) -> None:
         """Finalizes current_trade: records close price/time/reason/holding period,

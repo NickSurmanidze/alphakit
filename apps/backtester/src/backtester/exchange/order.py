@@ -247,11 +247,31 @@ class Orders:
         return order
 
     def add_order_processing_logic(self, order: Order) -> Order:
-        """Computes an order's fill-accounting fields: slippage-adjusted price (market
-        orders only), which asset/volume is sold vs. bought, and the fee (taker for
-        market, maker for limit/stoploss), folded into the sell or buy side depending on
-        order direction."""
+        """Computes an order's fill-accounting fields. If the exchange has a
+        symbol_config_provider (Tradovate/futures), fill price uses an absolute
+        tick-based slippage offset and fees are an absolute per-contract commission --
+        sell/buy asset/volume are left untouched since they're only read for
+        MarketType.spot balance locking, which futures never use. Otherwise (crypto):
+        slippage-adjusted price (market orders only), which asset/volume is sold vs.
+        bought, and the fee (taker for market, maker for limit/stoploss), folded into
+        the sell or buy side depending on order direction."""
         asset, quote = order.symbol.split("/")
+
+        if order.price is None:
+            raise ValueError("Price cannot be None at this stage")
+
+        provider = self.exchange.symbol_config_provider
+        if provider is not None:
+            slippage_amount, _unit = provider.get_slippage(asset, order.volume)
+            if order.side == OrderSide.buy:
+                order.price_with_slippage = order.price + slippage_amount
+            else:
+                order.price_with_slippage = order.price - slippage_amount
+
+            fee_amount, fee_currency = provider.get_fee(asset, order.volume)
+            order.fees_asset = fee_currency
+            order.fees_volume = fee_amount
+            return order
 
         if order.execution_type == OrderExecutionType.market:
             fee = self.exchange.taker_fee
@@ -261,9 +281,6 @@ class Orders:
             slippage = 0.0
 
         price_with_slippage = order.price or 0.0
-
-        if order.price is None:
-            raise ValueError("Price cannot be None at this stage")
 
         if order.side == OrderSide.buy:
             order.price_with_slippage = order.price + order.price * slippage

@@ -81,3 +81,71 @@ class MaxDailyLossMiddleware(Middleware):
             bt.exchange.orders.cancel_open_orders()
             self._halted_today = True
             bt.skip_tick()
+
+
+class TradeifyDrawdownMiddleware(Middleware):
+    """Prop-firm-style EOD trailing drawdown, modeled on Tradeify's evaluation rule:
+    once per calendar day (at the day boundary, using the *previous* day's final
+    equity -- never checked intraday), compares that day's ending balance against a
+    trailing threshold `highest_eod_balance_ever_reached * (1 - drawdown_percent)`. The
+    threshold only ever trails UP as new EOD highs are made, never down.
+
+    On breach: flattens every open position, cancels every open order, sets
+    account_failed=True, and halts permanently (skip_tick every tick from then on) --
+    unlike MaxDailyLossMiddleware this never resumes. Real balance/equity numbers are
+    never zeroed or altered, only trading is halted, so reporting/metrics stay
+    accurate."""
+
+    def __init__(self, drawdown_percent: float = 0.05) -> None:
+        """drawdown_percent: fraction (e.g. 0.05 = 5%) below the highest EOD balance
+        ever reached that triggers a permanent flatten-and-halt."""
+        self.drawdown_percent = drawdown_percent
+        self.account_failed: bool = False
+        self._current_day: date | None = None
+        self._last_balance_seen: float | None = None
+        self._highest_eod_balance: float | None = None
+        self._max_allowed_balance: float | None = None
+
+    def before_tick(self, bt: Backtester) -> None:
+        """Once failed, keeps flattening/halting forever. Otherwise seeds the trailing
+        high-water mark on the very first tick (so day 1 can never itself be a breach),
+        then on every subsequent day boundary checks the previous day's final equity
+        (captured by after_tick) against the trailing threshold, trailing it up on a
+        new high or failing the account on a breach."""
+        if self.account_failed:
+            bt.exchange.positions.close_all_open_positions()
+            bt.exchange.orders.cancel_open_orders()
+            bt.skip_tick()
+            return
+
+        current_day = bt.exchange.market.current["time_close"].date()
+
+        if self._current_day is None:
+            self._current_day = current_day
+            self._highest_eod_balance = bt.exchange.get_asset_total_in_usd()
+            self._max_allowed_balance = self._highest_eod_balance * (1 - self.drawdown_percent)
+            return
+
+        if current_day != self._current_day:
+            eod_balance = self._last_balance_seen
+            assert eod_balance is not None
+            assert self._max_allowed_balance is not None
+            assert self._highest_eod_balance is not None
+
+            if eod_balance <= self._max_allowed_balance:
+                self.account_failed = True
+                bt.exchange.positions.close_all_open_positions()
+                bt.exchange.orders.cancel_open_orders()
+                bt.skip_tick()
+            else:
+                self._highest_eod_balance = max(self._highest_eod_balance, eod_balance)
+                self._max_allowed_balance = self._highest_eod_balance * (1 - self.drawdown_percent)
+
+            self._current_day = current_day
+
+    def after_tick(self, bt: Backtester) -> None:
+        """Always runs (even on a skipped tick) -- records this tick's ending equity as
+        the latest candidate EOD balance for whichever day is current, since
+        before_tick needs the *previous* day's last balance at the moment the day
+        changes."""
+        self._last_balance_seen = bt.exchange.get_asset_total_in_usd()

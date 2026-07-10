@@ -1,9 +1,12 @@
 """Exchange: top-level simulation class that wires balance, positions, and orders together."""
 
+import math
+
 from backtester.exchange.balance import Balance, Transactions
 from backtester.exchange.event_log import EventLog
 from backtester.exchange.order import Orders
 from backtester.exchange.position import Positions
+from backtester.exchange.symbol_config import SymbolConfigProvider
 from backtester.exchange.types import (
     Log,
     MarginAllocationType,
@@ -27,9 +30,14 @@ class Exchange:
         max_leverage: int = 1,
         margin_allocation_type: MarginAllocationType = MarginAllocationType.isolated,
         event_log_enabled: bool = True,
+        symbol_config_provider: SymbolConfigProvider | None = None,
     ):
         """Builds fresh Balance/Transactions/Orders/Positions/EventLog sub-objects bound
-        to this exchange instance."""
+        to this exchange instance. `symbol_config_provider`, when set, switches fee/
+        slippage/margin/PnL math from the crypto percentage-of-price model to an
+        absolute, per-symbol one (point value, tick-based slippage, per-contract fees) --
+        see Orders.add_order_processing_logic() and get_point_value()/
+        round_position_size() below for exactly where it plugs in."""
         self.market: Market = market
         self.slippage: float = slippage
         self.maker_fee: float = maker_fee
@@ -37,6 +45,7 @@ class Exchange:
         self.market_type: MarketType = market_type
         self.max_leverage: int = max_leverage
         self.margin_allocation_type: MarginAllocationType = margin_allocation_type
+        self.symbol_config_provider: SymbolConfigProvider | None = symbol_config_provider
 
         self.logs: list[Log] = []
         self.event_log = EventLog(enabled=event_log_enabled)
@@ -68,6 +77,28 @@ class Exchange:
         if symbol not in self.market.current:
             raise ValueError(f"{symbol} symbol does not exist in current market data dict.")
         return float(self.market.current[symbol]["close"])
+
+    def get_point_value(self, symbol: str) -> float:
+        """Dollars a single 1.0 price-point move is worth for one contract of `symbol`
+        -- 1.0 (today's implicit crypto behavior, where price already is USD value)
+        unless symbol_config_provider is set."""
+        if self.symbol_config_provider is None:
+            return 1.0
+        asset, _quote = symbol.split("/")
+        return self.symbol_config_provider.get_point_value(asset)
+
+    def round_position_size(self, symbol: str, volume: float) -> float:
+        """Rounds `volume` down to `symbol`'s min_order_step (whole contracts, for
+        futures), returning 0.0 if the floored size is below its min_position_size --
+        never forces a minimum-size trade that would exceed the intended allocation.
+        No-op (returns `volume` unchanged) unless symbol_config_provider is set."""
+        if self.symbol_config_provider is None:
+            return volume
+        asset, _quote = symbol.split("/")
+        step = self.symbol_config_provider.get_min_order_step(asset)
+        min_size = self.symbol_config_provider.get_min_position_size(asset)
+        floored = math.floor(volume / step) * step
+        return floored if floored >= min_size else 0.0
 
     def get_market_candle(self, symbol: str):
         """Returns the full current candle dict (OHLC + indicators) for `symbol`."""

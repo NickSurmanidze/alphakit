@@ -8,7 +8,7 @@ expected fills/fees/PnL can be computed by hand and asserted exactly.
 import pandas as pd
 import pytest
 
-from backtester.exchange import Exchange, MarginAllocationType, MarketType
+from backtester.exchange import Exchange, MarginAllocationType, MarketType, SymbolConfigProvider
 from backtester.market import Market
 
 INTERVAL = pd.Timedelta("1h")
@@ -58,6 +58,7 @@ def make_exchange(  # noqa: PLR0913
     maker_fee: float = 0.0,
     taker_fee: float = 0.0,
     event_log_enabled: bool = True,
+    symbol_config_provider: SymbolConfigProvider | None = None,
 ) -> Exchange:
     return Exchange(
         market=market,
@@ -68,6 +69,7 @@ def make_exchange(  # noqa: PLR0913
         max_leverage=max_leverage,
         margin_allocation_type=margin_allocation_type,
         event_log_enabled=event_log_enabled,
+        symbol_config_provider=symbol_config_provider,
     )
 
 

@@ -45,7 +45,7 @@ class Rebalancer:
                 self.portfolio.signal_allocation_change_time_hash
             )
 
-    def rebalance(self):
+    def rebalance(self):  # noqa: PLR0912
         """Cancels all open orders, sizes the target allocation's positions/orders in
         volume terms, closes positions no longer in the target, opens/increases/reduces
         positions to match target sizes, re-creates TP/SL orders, and logs the resulting
@@ -58,12 +58,20 @@ class Rebalancer:
 
         for position in allocation.positions:
             price = self.exchange.get_market_price(symbol=position.symbol)
-            position.volume = (total_balance * position.percent) / price
-            position_dict[position.symbol] = position
+            point_value = self.exchange.get_point_value(position.symbol)
+            raw_volume = (total_balance * position.percent) / (price * point_value)
+            position.volume = self.exchange.round_position_size(position.symbol, raw_volume)
+            if position.volume > 0:
+                position_dict[position.symbol] = position
+            # else: floored to 0 contracts -- skip opening entirely. Since it's omitted
+            # from position_dict, the "close positions not in position_dict" loop below
+            # correctly flattens it if one was already open.
 
         for order in allocation.orders:
             price = self.exchange.get_market_price(symbol=order.symbol)
-            order.volume = (total_balance * order.percent) / price
+            point_value = self.exchange.get_point_value(order.symbol)
+            raw_volume = (total_balance * order.percent) / (price * point_value)
+            order.volume = self.exchange.round_position_size(order.symbol, raw_volume)
 
         current_open_positions = copy.deepcopy(self.exchange.positions.open_positions)
 
@@ -119,6 +127,8 @@ class Rebalancer:
                 )
 
         for order in allocation.orders:
+            if order.volume <= 0:
+                continue
             self.exchange.orders.create_order(
                 symbol=order.symbol,
                 side=order.side,

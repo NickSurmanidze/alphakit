@@ -156,7 +156,11 @@ class MaCrossoverStrategy(Strategy):
         if sl_order:
             self.allocation.orders.append(sl_order)
         self._mark_allocation_changed()
-        self.open_trade(side=side, open_price=price)
+        # sl_percent is exactly the fractional distance to the stop -- reuse it
+        # directly as this trade's R-multiple risk unit rather than re-deriving it
+        # from sl_price (which would be mathematically identical but redundant).
+        risk_percent = self.sl_percent if self.sl_enabled else None
+        self.open_trade(side=side, open_price=price, risk_percent=risk_percent)
 
     def _make_tp_order(self, side: PositionSide, price: float) -> AllocationOrder | None:
         """Builds the take-profit limit order for a new `side` position at `price`, or

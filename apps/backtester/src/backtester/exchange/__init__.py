@@ -20,6 +20,7 @@ from backtester.exchange.event_log import (
 )
 from backtester.exchange.order import Order, Orders
 from backtester.exchange.position import Position, Positions
+from backtester.exchange.symbol_config import SymbolConfigProvider, TradovateSymbolConfigProvider
 from backtester.exchange.types import (
     AssetBalance,
     AssetBalances,
@@ -68,6 +69,8 @@ __all__ = [
     "PositionSide",
     "PositionStatus",
     "Positions",
+    "SymbolConfigProvider",
+    "TradovateSymbolConfigProvider",
     "TransactionRecord",
     "Transactions",
 ]

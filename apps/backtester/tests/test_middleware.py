@@ -6,11 +6,12 @@ result before being written down as an assertion -- see the comments for the rea
 that aren't obvious from reading Backtester/Positions in isolation).
 """
 
+import pytest
 from conftest import build_market, make_exchange
 
 from backtester.backtest_runner import Backtester
 from backtester.exchange import PositionSide
-from backtester.middleware import MaxDailyLossMiddleware, Middleware
+from backtester.middleware import MaxDailyLossMiddleware, Middleware, TradeifyDrawdownMiddleware
 from backtester.performance import PerformanceAnalyzer
 from backtester.portfolio import Portfolio, WeightedStrategy
 from backtester.strategies.base import Allocation, AllocationPosition, Strategy
@@ -207,3 +208,88 @@ class TestMaxDailyLossMiddleware:
         position = exchange.positions.get_open_position_by_symbol("BTC/USD")
         assert position is not None
         assert position.volume == 8.5
+
+
+class _StubBacktester:
+    """Minimal Backtester stand-in exposing just what TradeifyDrawdownMiddleware reads:
+    .exchange and .skip_tick(). Driving the middleware directly (rather than through a
+    full Backtester + strategy + rebalancer) keeps this purely a test of the drawdown
+    timing/threshold logic -- P&L is injected directly via Balance methods instead of
+    being earned through real trades."""
+
+    def __init__(self, exchange) -> None:
+        self.exchange = exchange
+        self.skip_tick_calls = 0
+
+    def skip_tick(self) -> None:
+        self.skip_tick_calls += 1
+
+
+class TestTradeifyDrawdownMiddleware:
+    def test_eod_trailing_drawdown_full_scenario(self):
+        # Hourly candles from 2024-01-01T00:00 -- date() changes at candle index 24
+        # (2024-01-02 00:00), 48 (01-03), 72 (01-04). num=0 is the initial state and is
+        # never processed (matches the established convention in this file's other
+        # tests) -- ticks are driven via set_next_candle_as_current_market() + explicit
+        # before_tick/after_tick calls, starting from num=1.
+        market = build_market(
+            {"BTC/USD": [{"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0}] * 100}
+        )
+        exchange = make_exchange(market, max_leverage=1)
+        exchange.transactions.add_deposit(asset="USD", volume=10_000)
+        middleware = TradeifyDrawdownMiddleware(drawdown_percent=0.05)
+        stub = _StubBacktester(exchange)
+
+        def advance(n: int) -> None:
+            for _ in range(n):
+                market.set_next_candle_as_current_market()
+                middleware.before_tick(stub)
+                middleware.after_tick(stub)
+
+        # num=1: first tick ever -- seeds the trailing high-water mark from the current
+        # balance. Day-1 seeding must never itself count as a breach.
+        advance(1)
+        assert middleware.account_failed is False
+        assert middleware._highest_eod_balance == pytest.approx(10_000)
+        assert middleware._max_allowed_balance == pytest.approx(9_500)
+
+        # num=2..23: rest of day 1, balance unchanged.
+        advance(22)
+
+        # num=24: day boundary (day1 -> day2). EOD balance (10000) is above the 9500
+        # threshold -- no breach, and the high-water mark stays at 10000 (no new high).
+        advance(1)
+        assert middleware.account_failed is False
+        assert middleware._highest_eod_balance == pytest.approx(10_000)
+
+        # Simulate a $2000 gain during day 2 (balance -> 12000).
+        exchange.balance.increase_asset_balance(asset="USD", volume=2_000)
+        advance(23)  # num=25..47: rest of day 2
+
+        # num=48: day boundary (day2 -> day3). EOD balance (12000) is a new high -- the
+        # threshold trails UP to 12000 * 0.95 = 11400, not just staying at 9500.
+        advance(1)
+        assert middleware.account_failed is False
+        assert middleware._highest_eod_balance == pytest.approx(12_000)
+        assert middleware._max_allowed_balance == pytest.approx(11_400)
+
+        # Simulate a $3000 loss during day 3 (balance -> 9000, below the 11400 floor).
+        exchange.balance.reduce_asset_balance(asset="USD", volume=3_000)
+        advance(23)  # num=49..71: rest of day 3
+
+        # num=72: day boundary (day3 -> day4). EOD balance (9000) breaches the 11400
+        # trailing floor -- flattens (no-op, no open positions), cancels orders (no-op),
+        # fails the account, and halts this tick.
+        advance(1)
+        assert middleware.account_failed is True
+        assert stub.skip_tick_calls == 1
+        # Real balance/equity is never mutated by the middleware itself -- still exactly
+        # what we set it to, not zeroed.
+        assert exchange.get_asset_total_in_usd() == pytest.approx(9_000)
+
+        # num=73: once failed, the halt is permanent (unlike MaxDailyLossMiddleware,
+        # there's no next-day reset) -- keeps flattening/halting every subsequent tick.
+        advance(1)
+        assert middleware.account_failed is True
+        assert stub.skip_tick_calls == 2
+        assert exchange.get_asset_total_in_usd() == pytest.approx(9_000)

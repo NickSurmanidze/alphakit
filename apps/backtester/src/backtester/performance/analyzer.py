@@ -8,12 +8,37 @@ import numpy as np
 import pandas as pd
 
 from backtester.exchange import Exchange
-from backtester.exchange.event_log import EventLog
+from backtester.exchange.event_log import (
+    EventLog,
+    PositionClosed,
+    PositionLiquidated,
+    PositionReduced,
+)
 from backtester.market import Market
 from backtester.performance import metrics
 from backtester.performance.charts import make_report_figure
 from backtester.portfolio import Portfolio
 from backtester.strategies import Trade
+
+
+def _returns_from_series(series: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Forward-fills gaps (e.g. non-trading weekends/holidays once a daily-resampled
+    series has empty buckets for a non-24/7 market like futures) before computing
+    simple/log returns, then returns (simple_returns, log_returns).
+
+    Without the explicit ffill, a gap day silently poisons the very next real trading
+    day's return into NaN too (a NaN denominator in pct_change), erasing exactly the
+    move that happened across the gap -- e.g. every Monday's return for a weekday-only
+    market would be lost. pandas' pct_change() used to paper over this via an implicit
+    fill_method='pad' default, but that default is deprecated and not something this
+    package should depend on implicitly (crypto data has no gaps so this was invisible
+    until futures data started flowing through here). `fill_method=None` makes the
+    ffill-then-diff behavior explicit and pandas-version-proof instead.
+    """
+    filled = series.ffill()
+    simple_returns = filled.pct_change(fill_method=None)
+    log_returns = pd.Series(np.log1p(simple_returns), index=simple_returns.index)
+    return simple_returns, log_returns
 
 
 class PerformanceAnalyzer:
@@ -29,10 +54,16 @@ class PerformanceAnalyzer:
         portfolio: Portfolio | None = None,
         key: str = "algo",
         risk_free_rate: float = 0.0,
+        periods_per_year: int = 365,  # matches metrics.py's own default (crypto, 24/7)
     ):
         """`exchange`/`portfolio` are optional so a merge_reports() target can be built
         without either (it only needs pre-computed snapshots/trades from other
-        analyzers)."""
+        analyzers). `periods_per_year` controls Sharpe/Sortino/volatility/alpha
+        annualization -- defaults to 365 (correct for crypto's 24/7 markets, and
+        preserves this class's historical behavior); pass ~252 for futures/equities,
+        where every calendar day still gets a return row (weekends show 0%, see
+        _returns_from_series) but annualizing by the number of REAL trading days is
+        the industry-standard convention and won't match 365-based figures."""
         self.exchange = exchange
         self.portfolio = portfolio
         self.market = market
@@ -40,6 +71,7 @@ class PerformanceAnalyzer:
         self.key = key
         self.benchmark_symbols = benchmark_symbols
         self.risk_free_rate = risk_free_rate
+        self.periods_per_year = periods_per_year
 
         self.raw_snapshots: dict[pd.Timestamp, dict] = {}
         self.merged: pd.DataFrame | None = None
@@ -49,6 +81,10 @@ class PerformanceAnalyzer:
         # analyzer's snapshots but missing from at least one other, and therefore
         # silently skipped by merge_external_snapshots rather than summed in.
         self.skipped_timestamps: list[pd.Timestamp] = []
+        # Populated only by merge_reports(), as the union of every source analyzer's
+        # realized dollar PnLs -- a merged analyzer has no live exchange/event_log of
+        # its own to derive this from (see _get_realized_pnls()).
+        self._realized_pnls_override: list[float] | None = None
 
     @property
     def event_log(self) -> EventLog | None:
@@ -56,6 +92,26 @@ class PerformanceAnalyzer:
         reference -- recording is owned by Exchange (it's the source of the state
         changes), this just gives reports/tests a natural place to reach it from."""
         return self.exchange.event_log if self.exchange else None
+
+    def _get_realized_pnls(self) -> list[float]:
+        """Realized dollar PnL for every position close/reduce/liquidation, sourced
+        from the EventLog: PositionClosed/PositionReduced carry their own
+        realized_pnl_in_usd; PositionLiquidated doesn't (it forfeits the position's
+        entire margin, per Positions.liquidate_position), so that loss is reconstructed
+        as -margin_used_in_usd. Uses _realized_pnls_override instead if merge_reports()
+        set one (a merged analyzer has no live exchange/event_log of its own). Empty if
+        neither is available (e.g. event logging was disabled on the source exchange)."""
+        if self._realized_pnls_override is not None:
+            return self._realized_pnls_override
+        if self.event_log is None:
+            return []
+        pnls: list[float] = []
+        for event in self.event_log.get_events():
+            if isinstance(event, (PositionClosed, PositionReduced)):
+                pnls.append(event.realized_pnl_in_usd)
+            elif isinstance(event, PositionLiquidated):
+                pnls.append(-event.margin_used_in_usd)
+        return pnls
 
     # ------------------------------------------------------------------
     # Snapshot collection
@@ -179,11 +235,9 @@ class PerformanceAnalyzer:
                 }
             )
         )
+        simple_returns, log_returns = _returns_from_series(algo_df["net_balance"])
         return (
-            algo_df.assign(
-                simple_returns=lambda x: x["net_balance"].pct_change(),
-                log_returns=lambda x: np.log1p(x["net_balance"].pct_change()),
-            )
+            algo_df.assign(simple_returns=simple_returns, log_returns=log_returns)
             .assign(cumulative_returns=lambda x: np.exp(x["log_returns"].cumsum()))
             .assign(high_watermark=lambda x: x["cumulative_returns"].cummax())
             .assign(
@@ -203,11 +257,9 @@ class PerformanceAnalyzer:
             .resample("D")
             .agg({"close": "last", "time_open": "first", "time_close": "last"})
         )
+        simple_returns, log_returns = _returns_from_series(symbol_df["close"])
         return (
-            symbol_df.assign(
-                simple_returns=lambda x: x["close"].pct_change(),
-                log_returns=lambda x: np.log1p(x["close"].pct_change()),
-            )
+            symbol_df.assign(simple_returns=simple_returns, log_returns=log_returns)
             .assign(cumulative_returns=lambda x: np.exp(x["log_returns"].cumsum()))
             .assign(high_watermark=lambda x: x["cumulative_returns"].cummax())
             .assign(
@@ -266,9 +318,10 @@ class PerformanceAnalyzer:
 
     def generate_report(self) -> dict[str, dict[str, float]] | None:
         """Builds self.merged and populates self.summary with the full metric set
-        (Sharpe, Sortino, CAGR, drawdown, profit factor, win rate, ...) for the algo and
-        each benchmark symbol. Returns None (leaving summary unset) if there's no data
-        to report on."""
+        (Sharpe, Sortino, CAGR, drawdown, Ulcer Index, VaR/CVaR, skew/kurtosis, profit
+        factor, win rate, R-multiple expectancy, beta/correlation/alpha vs. each
+        benchmark, ...) for the algo and each benchmark symbol. Returns None (leaving
+        summary unset) if there's no data to report on."""
         self._build_merged_df()
 
         if self.merged is None or self.merged.shape[0] == 0:
@@ -280,22 +333,41 @@ class PerformanceAnalyzer:
         gross_return = float(algo_cum.values[-1])
         max_dd = float(self.merged[f"{self.key}__drawdown"].min())
         ann_return = metrics.cagr(gross_return, n_days)
+        realized_pnls = self._get_realized_pnls()
 
         self.summary[self.key] = {
-            "sharpe_ratio": metrics.sharpe_ratio(algo_returns, self.risk_free_rate),
-            "sortino_ratio": metrics.sortino_ratio(algo_returns, self.risk_free_rate),
-            "annualized_volatility_percent": metrics.annualized_volatility(algo_returns) * 100,
+            "sharpe_ratio": metrics.sharpe_ratio(
+                algo_returns, self.risk_free_rate, self.periods_per_year
+            ),
+            "sortino_ratio": metrics.sortino_ratio(
+                algo_returns, self.risk_free_rate, self.periods_per_year
+            ),
+            "annualized_volatility_percent": (
+                metrics.annualized_volatility(algo_returns, self.periods_per_year) * 100
+            ),
             "cagr_percent": ann_return * 100,
             "calmar_ratio": metrics.calmar_ratio(ann_return, max_dd),
             "recovery_factor": metrics.recovery_factor(gross_return - 1, max_dd),
             "max_drawdown_percent": round(max_dd, 6) * 100,
+            "max_drawdown_duration_days": float(metrics.max_drawdown_duration_days(algo_cum)),
+            "ulcer_index": metrics.ulcer_index(algo_cum),
+            "var_95_percent": metrics.value_at_risk(algo_returns, 0.95) * 100,
+            "cvar_95_percent": metrics.conditional_value_at_risk(algo_returns, 0.95) * 100,
+            "returns_skewness": metrics.returns_skewness(algo_returns),
+            "returns_kurtosis": metrics.returns_kurtosis(algo_returns),
             "gross_return_percent": gross_return * 100,
             "net_return_percent": (gross_return - 1) * 100,
             "profit_factor": metrics.profit_factor(self.trades),
+            "dollar_profit_factor": metrics.dollar_profit_factor(realized_pnls),
+            "dollar_expectancy": metrics.dollar_expectancy(realized_pnls),
             "win_rate_percent": metrics.win_rate(self.trades) * 100,
             "avg_win_loss_ratio": metrics.avg_win_loss_ratio(self.trades),
+            "r_multiple_expectancy": metrics.r_multiple_expectancy(self.trades),
             "max_consecutive_losses": float(metrics.max_consecutive_losses(self.trades)),
             "avg_holding_period_min": metrics.avg_holding_period_minutes(self.trades),
+            "time_in_market_percent": metrics.time_in_market_percent(
+                self.merged[f"{self.key}__exchange_gross_exposure"]
+            ),
             "closed_trades": float(len(self.trades)),
             "winner_trades": float(
                 sum(1 for t in self.trades if t.result is not None and t.result.value == "winner")
@@ -311,18 +383,39 @@ class PerformanceAnalyzer:
             sym_gross = float(sym_cum.values[-1])
             sym_max_dd = float(self.merged[f"{symbol}__drawdown"].min())
             sym_ann = metrics.cagr(sym_gross, n_days)
+            sym_beta = metrics.beta(algo_returns, sym_returns)
 
             self.summary[symbol] = {
-                "sharpe_ratio": metrics.sharpe_ratio(sym_returns, self.risk_free_rate),
-                "sortino_ratio": metrics.sortino_ratio(sym_returns, self.risk_free_rate),
-                "annualized_volatility_percent": metrics.annualized_volatility(sym_returns) * 100,
+                "sharpe_ratio": metrics.sharpe_ratio(
+                    sym_returns, self.risk_free_rate, self.periods_per_year
+                ),
+                "sortino_ratio": metrics.sortino_ratio(
+                    sym_returns, self.risk_free_rate, self.periods_per_year
+                ),
+                "annualized_volatility_percent": (
+                    metrics.annualized_volatility(sym_returns, self.periods_per_year) * 100
+                ),
                 "cagr_percent": sym_ann * 100,
                 "calmar_ratio": metrics.calmar_ratio(sym_ann, sym_max_dd),
                 "recovery_factor": metrics.recovery_factor(sym_gross - 1, sym_max_dd),
                 "max_drawdown_percent": round(sym_max_dd, 6) * 100,
+                "max_drawdown_duration_days": float(metrics.max_drawdown_duration_days(sym_cum)),
+                "ulcer_index": metrics.ulcer_index(sym_cum),
+                "var_95_percent": metrics.value_at_risk(sym_returns, 0.95) * 100,
+                "cvar_95_percent": metrics.conditional_value_at_risk(sym_returns, 0.95) * 100,
+                "returns_skewness": metrics.returns_skewness(sym_returns),
+                "returns_kurtosis": metrics.returns_kurtosis(sym_returns),
                 "gross_return_percent": sym_gross * 100,
                 "net_return_percent": (sym_gross - 1) * 100,
             }
+
+            self.summary[self.key][f"beta_vs_{symbol}"] = sym_beta
+            self.summary[self.key][f"correlation_vs_{symbol}"] = metrics.correlation(
+                algo_returns, sym_returns
+            )
+            self.summary[self.key][f"alpha_percent_vs_{symbol}"] = (
+                metrics.alpha(algo_returns, sym_returns, sym_beta, self.periods_per_year) * 100
+            )
 
         return self.summary
 
@@ -419,9 +512,11 @@ def merge_reports(
         benchmark_symbols=first.benchmark_symbols,
         key=key,
         risk_free_rate=first.risk_free_rate,
+        periods_per_year=first.periods_per_year,
     )
     merged.merge_external_snapshots([a.raw_snapshots for a in analyzers])
     merged.trades = [trade for a in analyzers for trade in a.trades]
     merged.skipped_timestamps = _find_skipped_timestamps([a.raw_snapshots for a in analyzers])
+    merged._realized_pnls_override = [pnl for a in analyzers for pnl in a._get_realized_pnls()]
     merged.generate_report()
     return merged
