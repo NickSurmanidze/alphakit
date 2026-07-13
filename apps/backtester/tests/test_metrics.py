@@ -55,6 +55,35 @@ class TestDollarProfitFactorAndExpectancy:
         assert metrics.dollar_expectancy([]) == 0.0
 
 
+class TestSharpeLowerBound:
+    def test_lower_bound_is_below_point_estimate_sharpe(self):
+        rng = np.random.default_rng(7)
+        returns = pd.Series(rng.normal(0.001, 0.01, 250))
+        sr = metrics.sharpe_ratio(returns, periods_per_year=250)
+        sr_lb = metrics.sharpe_lower_bound(returns, periods_per_year=250)
+        assert sr_lb < sr
+
+    def test_smaller_sample_gives_wider_penalty_at_equal_sharpe(self):
+        # Same mean/std (so identical point-estimate Sharpe), but one series is 4x
+        # longer -- its lower bound should sit closer to the point estimate.
+        short = pd.Series([0.01, -0.005] * 15)  # n=30
+        long = pd.Series([0.01, -0.005] * 60)  # n=120
+        sr_short = metrics.sharpe_ratio(short, periods_per_year=252)
+        sr_long = metrics.sharpe_ratio(long, periods_per_year=252)
+        # not bit-identical -- pandas' ddof=1 sample std carries a slightly different
+        # small-sample bias at n=30 vs n=120 -- but close enough that the comparison
+        # below isolates the lower-bound penalty, not a point-estimate difference.
+        assert sr_short == pytest.approx(sr_long, rel=0.02)
+
+        gap_short = sr_short - metrics.sharpe_lower_bound(short, periods_per_year=252)
+        gap_long = sr_long - metrics.sharpe_lower_bound(long, periods_per_year=252)
+        assert gap_short > gap_long
+
+    def test_fewer_than_two_observations_returns_zero(self):
+        assert metrics.sharpe_lower_bound(pd.Series([], dtype=float)) == 0.0
+        assert metrics.sharpe_lower_bound(pd.Series([0.01])) == 0.0
+
+
 class TestTimeInMarketPercent:
     def test_fraction_of_nonzero_exposure_periods(self):
         exposure = pd.Series([0.0, 0.5, 0.5, 0.0, 1.0])

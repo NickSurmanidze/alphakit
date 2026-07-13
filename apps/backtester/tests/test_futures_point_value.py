@@ -134,6 +134,41 @@ class TestRefreshPositionPnl:
         assert position.value_in_usd == pytest.approx(50100.0)  # 2 * 5010 * 5
 
 
+class TestMaxPositionSizeClamp:
+    def test_clamps_above_ceiling(self):
+        market = build_market(
+            {"MES/USD": [{"open": 5000.0, "high": 5000.0, "low": 5000.0, "close": 5000.0}]}
+        )
+        provider = TradovateSymbolConfigProvider(
+            symbols={"MES": SymbolConfig(point_value=5.0, max_position_size=1.0)}
+        )
+        exchange = make_exchange(market, max_leverage=1, symbol_config_provider=provider)
+
+        # Sizing formula asked for 2.7 contracts -- floors to 2, then clamps to the
+        # configured ceiling of 1, e.g. equity having compounded past what a "1
+        # contract each" weight was originally tuned for.
+        assert exchange.round_position_size("MES/USD", 2.7) == pytest.approx(1.0)
+
+    def test_no_clamp_when_under_ceiling(self):
+        market = build_market(
+            {"MES/USD": [{"open": 5000.0, "high": 5000.0, "low": 5000.0, "close": 5000.0}]}
+        )
+        provider = TradovateSymbolConfigProvider(
+            symbols={"MES": SymbolConfig(point_value=5.0, max_position_size=3.0)}
+        )
+        exchange = make_exchange(market, max_leverage=1, symbol_config_provider=provider)
+
+        assert exchange.round_position_size("MES/USD", 1.9) == pytest.approx(1.0)
+
+    def test_no_ceiling_by_default(self):
+        market = build_market(
+            {"MES/USD": [{"open": 5000.0, "high": 5000.0, "low": 5000.0, "close": 5000.0}]}
+        )
+        exchange = make_exchange(market, max_leverage=1, symbol_config_provider=_mes_provider())
+
+        assert exchange.round_position_size("MES/USD", 50.0) == pytest.approx(50.0)
+
+
 class TestNoProviderIsPassThrough:
     def test_get_point_value_defaults_to_one(self):
         market = build_market(

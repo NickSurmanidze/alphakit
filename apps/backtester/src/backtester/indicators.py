@@ -60,6 +60,8 @@ class IndicatorType(Enum):
     RSI = "RSI"
     STOCH = "STOCH"
     STOCHRSI = "STOCHRSI"
+    KAMA = "KAMA"
+    DEMA = "DEMA"
 
 
 class StochRsiTarget(Enum):
@@ -122,6 +124,93 @@ class Indicators:
 
         ema.name = f"{IndicatorType.EMA.value}_{length}"
         return ema
+
+    @staticmethod
+    def kama(
+        ohlc: DataFrame, length: int = 10, fast: int = 2, slow: int = 30, column: str = "close"
+    ) -> Series:
+        """
+        Kaufman's Adaptive Moving Average - optimized with pandas_ta.
+
+        Adjusts its own smoothing constant based on an efficiency ratio (how
+        directional vs. choppy recent price action has been) computed over `length`
+        bars: tracks fast during clean trends, flattens out during chop. `fast`/`slow`
+        set the EMA-equivalent smoothing-constant bounds it interpolates between --
+        Kaufman's own defaults (2, 30) if not overridden.
+
+        Args:
+            ohlc: OHLC DataFrame
+            length: Efficiency-ratio lookback period
+            fast: Fast EMA-equivalent period bound (more reactive, must be < slow)
+            slow: Slow EMA-equivalent period bound (less reactive, must be > fast)
+            column: Column to use for calculation
+
+        Returns:
+            KAMA Series with proper naming
+        """
+        kama = pandas_ta.kama(ohlc[column], length=length, fast=fast, slow=slow)
+        if kama is None:
+            raise ValueError("KAMA calculation returned None")
+
+        if not isinstance(kama, Series):
+            raise ValueError("KAMA should return a pandas Series")
+
+        kama.name = f"{IndicatorType.KAMA.value}_{length}"
+        return kama
+
+    @staticmethod
+    def hma(ohlc: DataFrame, length: int = 13, column: str = "close") -> Series:
+        """
+        Hull Moving Average - optimized with pandas_ta.
+
+        A weighted-MA construction (sqrt(length)-period WMA of the difference between
+        two half/full-length WMAs) designed to track price more closely than a plain
+        MA of the same length while still smoothing noise -- lower lag for a given
+        amount of smoothing than SMA/EMA.
+
+        Args:
+            ohlc: OHLC DataFrame
+            length: Period for calculation
+            column: Column to use for calculation
+
+        Returns:
+            HMA Series with proper naming
+        """
+        hma = pandas_ta.hma(ohlc[column], length)
+        if hma is None:
+            raise ValueError("HMA calculation returned None")
+
+        if not isinstance(hma, Series):
+            raise ValueError("HMA should return a pandas Series")
+
+        hma.name = f"{IndicatorType.HMA.value}_{length}"
+        return hma
+
+    @staticmethod
+    def dema(ohlc: DataFrame, length: int = 13, column: str = "close") -> Series:
+        """
+        Double Exponential Moving Average - optimized with pandas_ta.
+
+        Applies EMA twice and combines the two (2*EMA - EMA(EMA)) to cancel out most
+        of the lag a plain EMA of the same length would have.
+
+        Args:
+            ohlc: OHLC DataFrame
+            length: Period for calculation
+            column: Column to use for calculation
+
+        Returns:
+            DEMA Series with proper naming
+        """
+        dema = pandas_ta.dema(ohlc[column], length)
+        if dema is None:
+            raise ValueError("DEMA calculation returned None")
+
+        if not isinstance(dema, Series):
+            raise ValueError("DEMA should return a pandas Series")
+
+        dema.name = f"{IndicatorType.DEMA.value}_{length}"
+        return dema
 
     @staticmethod
     def rsi(ohlc: DataFrame, length: int = 14, column: str = "close") -> Series:

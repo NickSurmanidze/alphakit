@@ -266,30 +266,145 @@ class TestTradeifyDrawdownMiddleware:
         exchange.balance.increase_asset_balance(asset="USD", volume=2_000)
         advance(23)  # num=25..47: rest of day 2
 
-        # num=48: day boundary (day2 -> day3). EOD balance (12000) is a new high -- the
-        # threshold trails UP to 12000 * 0.95 = 11400, not just staying at 9500.
+        # num=48: day boundary (day2 -> day3). EOD balance (12000) is a new high, but it
+        # also crosses the lock threshold (10_000 * 1.05 + 100 = 10_600) -- so instead
+        # of trailing to 12000 * 0.95 = 11400, the floor LOCKS permanently at
+        # initial_balance + lock_grace_dollars = 10_100.
         advance(1)
         assert middleware.account_failed is False
+        assert middleware.locked is True
         assert middleware._highest_eod_balance == pytest.approx(12_000)
-        assert middleware._max_allowed_balance == pytest.approx(11_400)
+        assert middleware._max_allowed_balance == pytest.approx(10_100)
 
-        # Simulate a $3000 loss during day 3 (balance -> 9000, below the 11400 floor).
-        exchange.balance.reduce_asset_balance(asset="USD", volume=3_000)
+        # Simulate a $1950 loss during day 3 (balance -> 10050, below the locked 10100
+        # floor but well above what the old trailing-only floor of 11400 would have
+        # been -- this scenario specifically exercises the locked floor, not the trail).
+        exchange.balance.reduce_asset_balance(asset="USD", volume=1_950)
         advance(23)  # num=49..71: rest of day 3
 
-        # num=72: day boundary (day3 -> day4). EOD balance (9000) breaches the 11400
-        # trailing floor -- flattens (no-op, no open positions), cancels orders (no-op),
+        # num=72: day boundary (day3 -> day4). EOD balance (10050) breaches the locked
+        # 10100 floor -- flattens (no-op, no open positions), cancels orders (no-op),
         # fails the account, and halts this tick.
         advance(1)
         assert middleware.account_failed is True
         assert stub.skip_tick_calls == 1
         # Real balance/equity is never mutated by the middleware itself -- still exactly
         # what we set it to, not zeroed.
-        assert exchange.get_asset_total_in_usd() == pytest.approx(9_000)
+        assert exchange.get_asset_total_in_usd() == pytest.approx(10_050)
 
         # num=73: once failed, the halt is permanent (unlike MaxDailyLossMiddleware,
         # there's no next-day reset) -- keeps flattening/halting every subsequent tick.
         advance(1)
         assert middleware.account_failed is True
         assert stub.skip_tick_calls == 2
-        assert exchange.get_asset_total_in_usd() == pytest.approx(9_000)
+        assert exchange.get_asset_total_in_usd() == pytest.approx(10_050)
+
+    def test_locked_floor_does_not_rise_further_as_balance_keeps_climbing(self):
+        # Same $10k/5% setup as above, but instead of a loss after locking, balance
+        # keeps climbing -- the floor must stay pinned at 10_100, not keep trailing.
+        market = build_market(
+            {"BTC/USD": [{"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0}] * 150}
+        )
+        exchange = make_exchange(market, max_leverage=1)
+        exchange.transactions.add_deposit(asset="USD", volume=10_000)
+        middleware = TradeifyDrawdownMiddleware(drawdown_percent=0.05)
+        stub = _StubBacktester(exchange)
+
+        def advance(n: int) -> None:
+            for _ in range(n):
+                market.set_next_candle_as_current_market()
+                middleware.before_tick(stub)
+                middleware.after_tick(stub)
+
+        advance(1)  # num=1: seed at 10_000
+        advance(22)  # rest of day 1
+
+        # Gain past the lock threshold (10_600) during day 2 -> balance 12_000.
+        exchange.balance.increase_asset_balance(asset="USD", volume=2_000)
+        advance(24)  # num=24 (day1->day2 boundary, no new high yet) .. num=47
+
+        advance(1)  # num=48: day2->day3 boundary -- locks at floor 10_100
+        assert middleware.locked is True
+        assert middleware._max_allowed_balance == pytest.approx(10_100)
+
+        # Balance keeps climbing well past the lock trigger during day 3.
+        exchange.balance.increase_asset_balance(asset="USD", volume=20_000)  # -> 32_000
+        advance(23)  # rest of day 3
+
+        advance(1)  # num=72: day3->day4 boundary
+        assert middleware.account_failed is False
+        assert middleware.locked is True
+        # Floor stays pinned at 10_100 -- NOT 32_000 * 0.95 = 30_400, which is what
+        # the pre-lock trailing formula would have produced.
+        assert middleware._max_allowed_balance == pytest.approx(10_100)
+        assert middleware._highest_eod_balance == pytest.approx(32_000)
+
+    def test_account_can_still_fail_while_locked(self):
+        # Confirms the locked floor is a real breach threshold, not just a reported
+        # number -- a large-enough drop after locking still fails the account.
+        market = build_market(
+            {"BTC/USD": [{"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0}] * 100}
+        )
+        exchange = make_exchange(market, max_leverage=1)
+        exchange.transactions.add_deposit(asset="USD", volume=10_000)
+        middleware = TradeifyDrawdownMiddleware(drawdown_percent=0.05)
+        stub = _StubBacktester(exchange)
+
+        def advance(n: int) -> None:
+            for _ in range(n):
+                market.set_next_candle_as_current_market()
+                middleware.before_tick(stub)
+                middleware.after_tick(stub)
+
+        advance(1)  # num=1: seed at 10_000
+        advance(22)
+
+        exchange.balance.increase_asset_balance(asset="USD", volume=2_000)  # -> 12_000
+        advance(24)
+
+        advance(1)  # num=48: locks, floor = 10_100
+        assert middleware.locked is True
+
+        # Crash straight through the locked floor (12_000 -> 5_000).
+        exchange.balance.reduce_asset_balance(asset="USD", volume=7_000)
+        advance(23)
+
+        advance(1)  # num=72: breaches the locked floor
+        assert middleware.account_failed is True
+        assert middleware.locked is True  # stays True, doesn't get reset by failure
+        assert stub.skip_tick_calls == 1
+
+    def test_locked_stays_true_permanently_once_set(self):
+        # Once locked, later days that make new (but sub-lock-threshold-irrelevant)
+        # highs must not somehow flip locked back to False -- there's no unlock path.
+        market = build_market(
+            {"BTC/USD": [{"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0}] * 150}
+        )
+        exchange = make_exchange(market, max_leverage=1)
+        exchange.transactions.add_deposit(asset="USD", volume=10_000)
+        middleware = TradeifyDrawdownMiddleware(drawdown_percent=0.05)
+        stub = _StubBacktester(exchange)
+
+        def advance(n: int) -> None:
+            for _ in range(n):
+                market.set_next_candle_as_current_market()
+                middleware.before_tick(stub)
+                middleware.after_tick(stub)
+
+        advance(1)
+        advance(22)
+        assert middleware.locked is False
+
+        exchange.balance.increase_asset_balance(asset="USD", volume=2_000)  # -> 12_000
+        advance(24)
+        advance(1)  # num=48: locks
+        assert middleware.locked is True
+
+        # A further gain and several more day boundaries pass -- still locked.
+        exchange.balance.increase_asset_balance(asset="USD", volume=5_000)  # -> 17_000
+        advance(23)
+        advance(1)  # num=72
+        assert middleware.locked is True
+        advance(23)
+        advance(1)  # num=96
+        assert middleware.locked is True

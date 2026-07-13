@@ -59,6 +59,7 @@ def make_exchange(  # noqa: PLR0913
     taker_fee: float = 0.0,
     event_log_enabled: bool = True,
     symbol_config_provider: SymbolConfigProvider | None = None,
+    leverage_aware_sizing: bool = False,
 ) -> Exchange:
     return Exchange(
         market=market,
@@ -70,6 +71,7 @@ def make_exchange(  # noqa: PLR0913
         margin_allocation_type=margin_allocation_type,
         event_log_enabled=event_log_enabled,
         symbol_config_provider=symbol_config_provider,
+        leverage_aware_sizing=leverage_aware_sizing,
     )
 
 

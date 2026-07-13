@@ -384,7 +384,14 @@ class Orders:
                 symbol=order.symbol,
                 price=order.price_with_slippage,
                 volume=order.volume,
-                side=PositionSide.long,
+                # The side THIS ORDER pushes the position toward (buy -> long, sell ->
+                # short) -- not always PositionSide.long. A sell order closing an
+                # existing long must net against it (added_volume=0, frees margin,
+                # doesn't need fresh margin); hardcoding long here made
+                # calculate_required_margin treat every closing sell as if it were
+                # opening a brand new long of the same size, demanding fresh margin
+                # for what should be a margin-freeing close.
+                side=PositionSide.long if order.side == OrderSide.buy else PositionSide.short,
             )
             total_required_balance = required_margin + order.fees_volume
             balance = self.exchange.balance.get_balance()
@@ -465,7 +472,11 @@ class Orders:
                         symbol=order.symbol,
                         price=order.price_with_slippage,
                         volume=order.volume,
-                        side=PositionSide.long,
+                        # See the matching comment in validate_order_before_creating --
+                        # side must reflect this order's own direction, not always long.
+                        side=(
+                            PositionSide.long if order.side == OrderSide.buy else PositionSide.short
+                        ),
                     )
                     total_required_balance = required_margin + order.fees_volume
                     balance = self.exchange.balance.get_balance()

@@ -48,18 +48,25 @@ class Rebalancer:
     def rebalance(self):  # noqa: PLR0912
         """Cancels all open orders, sizes the target allocation's positions/orders in
         volume terms, closes positions no longer in the target, opens/increases/reduces
-        positions to match target sizes, re-creates TP/SL orders, and logs the resulting
-        exposure."""
+        positions to match target sizes (in `allocation.positions` order -- see
+        Portfolio._symbol_priority for how that order is set, highest-priority first),
+        re-creates TP/SL orders for whatever actually opened, and logs the resulting
+        exposure.
+
+        Sizing is leveraged (`* self.exchange.max_leverage`) only when
+        `self.exchange.leverage_aware_sizing` is set -- see Exchange.__init__'s
+        docstring for why that's opt-in rather than always-on."""
         self.exchange.orders.cancel_open_orders()
 
         total_balance = self.exchange.get_asset_total_in_usd()
         allocation = self.get_allocation()
+        leverage = self.exchange.max_leverage if self.exchange.leverage_aware_sizing else 1
         position_dict = dict()
 
         for position in allocation.positions:
             price = self.exchange.get_market_price(symbol=position.symbol)
             point_value = self.exchange.get_point_value(position.symbol)
-            raw_volume = (total_balance * position.percent) / (price * point_value)
+            raw_volume = (total_balance * position.percent * leverage) / (price * point_value)
             position.volume = self.exchange.round_position_size(position.symbol, raw_volume)
             if position.volume > 0:
                 position_dict[position.symbol] = position
@@ -70,7 +77,7 @@ class Rebalancer:
         for order in allocation.orders:
             price = self.exchange.get_market_price(symbol=order.symbol)
             point_value = self.exchange.get_point_value(order.symbol)
-            raw_volume = (total_balance * order.percent) / (price * point_value)
+            raw_volume = (total_balance * order.percent * leverage) / (price * point_value)
             order.volume = self.exchange.round_position_size(order.symbol, raw_volume)
 
         current_open_positions = copy.deepcopy(self.exchange.positions.open_positions)
@@ -81,62 +88,90 @@ class Rebalancer:
 
         current_open_positions = copy.deepcopy(self.exchange.positions.open_positions)
 
+        # Symbols actually opened/resized this tick (as opposed to merely targeted in
+        # position_dict) -- only these get their SL/TP orders re-created below. A
+        # symbol can be targeted but still end up here without succeeding: leveraged
+        # sizing can ask for more than whatever free margin remains once
+        # higher-priority positions (processed first, in list order) have already
+        # claimed their share.
+        opened_symbols: set[str] = set()
+
         for position in position_dict.values():
-            if position.symbol not in current_open_positions:
-                side = OrderSide.buy if position.side == PositionSide.long else OrderSide.sell
-                self.exchange.orders.create_order(
-                    symbol=position.symbol,
-                    side=side,
-                    volume=position.volume,
-                    execution_type=OrderExecutionType.market,
-                    reason="open position",
-                )
-            elif current_open_positions[position.symbol].side == position.side:
-                if current_open_positions[position.symbol].volume > position.volume:
-                    side = OrderSide.sell if position.side == PositionSide.long else OrderSide.buy
+            try:
+                if position.symbol not in current_open_positions:
+                    side = OrderSide.buy if position.side == PositionSide.long else OrderSide.sell
                     self.exchange.orders.create_order(
                         symbol=position.symbol,
                         side=side,
                         volume=position.volume,
                         execution_type=OrderExecutionType.market,
-                        reason="reduce position",
+                        reason="open position",
                     )
+                elif current_open_positions[position.symbol].side == position.side:
+                    if current_open_positions[position.symbol].volume > position.volume:
+                        side = (
+                            OrderSide.sell if position.side == PositionSide.long else OrderSide.buy
+                        )
+                        self.exchange.orders.create_order(
+                            symbol=position.symbol,
+                            side=side,
+                            volume=position.volume,
+                            execution_type=OrderExecutionType.market,
+                            reason="reduce position",
+                        )
+                    else:
+                        side = (
+                            OrderSide.buy if position.side == PositionSide.long else OrderSide.sell
+                        )
+                        volume_to_increase = (
+                            position.volume - current_open_positions[position.symbol].volume
+                        )
+                        self.exchange.orders.create_order(
+                            symbol=position.symbol,
+                            side=side,
+                            volume=volume_to_increase,
+                            execution_type=OrderExecutionType.market,
+                            reason="increase position",
+                        )
                 else:
-                    side = OrderSide.buy if position.side == PositionSide.long else OrderSide.sell
-                    volume_to_increase = (
-                        position.volume - current_open_positions[position.symbol].volume
+                    self.exchange.positions.close_position(
+                        position=current_open_positions[position.symbol]
                     )
+                    side = OrderSide.buy if position.side == PositionSide.long else OrderSide.sell
                     self.exchange.orders.create_order(
                         symbol=position.symbol,
                         side=side,
-                        volume=volume_to_increase,
+                        volume=position.volume,
                         execution_type=OrderExecutionType.market,
-                        reason="increase position",
+                        reason="open position",
                     )
-            else:
-                self.exchange.positions.close_position(
-                    position=current_open_positions[position.symbol]
+            except ValueError as exc:
+                # Insufficient margin for this (lower-priority) position -- skip it
+                # rather than letting the whole backtest crash. Reducing an existing
+                # position only ever frees margin, so this can only happen on an
+                # open/increase/re-open.
+                self.exchange.add_log(
+                    f"Skipped {position.symbol} ({position.side.value}, "
+                    f"{position.volume} contracts) -- insufficient margin: {exc}"
                 )
-                side = OrderSide.buy if position.side == PositionSide.long else OrderSide.sell
-                self.exchange.orders.create_order(
-                    symbol=position.symbol,
-                    side=side,
-                    volume=position.volume,
-                    execution_type=OrderExecutionType.market,
-                    reason="open position",
-                )
+                continue
+
+            opened_symbols.add(position.symbol)
 
         for order in allocation.orders:
-            if order.volume <= 0:
+            if order.volume <= 0 or order.symbol not in opened_symbols:
                 continue
-            self.exchange.orders.create_order(
-                symbol=order.symbol,
-                side=order.side,
-                volume=order.volume,
-                execution_type=order.execution_type,
-                price=order.price,
-                reason="sl / tp",
-            )
+            try:
+                self.exchange.orders.create_order(
+                    symbol=order.symbol,
+                    side=order.side,
+                    volume=order.volume,
+                    execution_type=order.execution_type,
+                    price=order.price,
+                    reason="sl / tp",
+                )
+            except ValueError as exc:
+                self.exchange.add_log(f"Skipped SL/TP order for {order.symbol}: {exc}")
 
         exchange_exposure = self.exchange.get_exposure()
         portfolio_exposure = self.portfolio.exposure

@@ -33,6 +33,10 @@ class SymbolConfigProvider(Protocol):
         """Smallest position-size increment (in contracts) for `asset`."""
         ...
 
+    def get_max_position_size(self, asset: str) -> float | None:
+        """Hard ceiling on contracts per position for `asset`, or None if uncapped."""
+        ...
+
     def get_fee(self, asset: str, position_size: float) -> tuple[float, str]:
         """Total commission for a `position_size`-contract fill of `asset`, as
         (amount, currency) -- e.g. (1.0, "USD")."""
@@ -78,6 +82,9 @@ class TradovateSymbolConfigProvider:
 
     def get_min_order_step(self, asset: str) -> float:
         return self._lookup(asset).min_order_step
+
+    def get_max_position_size(self, asset: str) -> float | None:
+        return self._lookup(asset).max_position_size
 
     def get_fee(self, asset: str, position_size: float) -> tuple[float, str]:
         cfg = self._lookup(asset)

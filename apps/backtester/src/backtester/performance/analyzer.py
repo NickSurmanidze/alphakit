@@ -17,6 +17,7 @@ from backtester.exchange.event_log import (
 from backtester.market import Market
 from backtester.performance import metrics
 from backtester.performance.charts import make_report_figure
+from backtester.performance.report_html import render_summary_html
 from backtester.portfolio import Portfolio
 from backtester.strategies import Trade
 
@@ -418,6 +419,25 @@ class PerformanceAnalyzer:
             )
 
         return self.summary
+
+    def summary_dataframe(self) -> pd.DataFrame:
+        """Reshapes self.summary (a dict keyed by self.key/benchmark symbol, each a
+        dict of metric name -> value) into a DataFrame -- one row per metric, one
+        column per key/symbol -- for a readable table instead of a wall of JSON.
+        Empty DataFrame if generate_report() hasn't run yet."""
+        if not self.summary:
+            return pd.DataFrame()
+        df = pd.DataFrame(self.summary).round(4)
+        df.index.name = "metric"
+        return df
+
+    def summary_html_table(self) -> str:
+        """HTML rendering of summary_dataframe(): a plain-English description column
+        plus color-coding (absolute quality bands where a fixed threshold is
+        meaningful, a "best in row" highlight across columns otherwise) -- see
+        backtester.performance.report_html for the per-metric rules. Wrap the
+        returned string in IPython.display.HTML(...) to render in a notebook."""
+        return render_summary_html(self.summary_dataframe())
 
     # ------------------------------------------------------------------
     # Chart output — explicit opt-in

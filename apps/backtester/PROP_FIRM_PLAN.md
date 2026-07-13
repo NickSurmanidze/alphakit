@@ -11,15 +11,52 @@ record across sessions.
       symbols; EMD explicitly skipped — registered in Mongo but has no usable data)
 - [x] `exchange/symbol_config.py`: `SymbolConfigProvider` Protocol +
       `TradovateSymbolConfigProvider`
-- [ ] **Research TODO**: verify tick_size for all 18 symbols against CME spec sheets
-      (not yet done — every `SymbolConfig.tick_size` is `None`; `get_slippage()` raises
-      for any symbol until its tick size is filled in, `slippage_ticks=0` is the
-      documented temporary workaround)
+- [x] **MES tick_size researched** (2026-07-10): CME contract spec — 0.25 index
+      points = $1.25/tick
+      ([source](https://www.cmegroup.com/markets/equities/sp/micro-e-mini-sandp-500.contractSpecs.html)).
+      Set in `exchange_config.py`.
+- [x] **MNQ tick_size researched** (2026-07-10): CME contract spec — 0.25 index
+      points = $0.50/tick
+      ([source](https://www.cmegroup.com/markets/equities/nasdaq/micro-e-mini-nasdaq-100.contractSpecs.html)).
+      Set in `exchange_config.py`.
+- [x] **M2K tick_size researched** (2026-07-10): CME contract spec — 0.10 index
+      points = $0.50/tick
+      ([source](https://www.cmegroup.com/markets/equities/russell/micro-e-mini-russell-2000.html)).
+      Set in `exchange_config.py`.
+- [x] **M6E tick_size researched** (2026-07-10): CME contract spec — 0.0001 EUR =
+      $1.25/tick
+      ([source](https://www.cmegroup.com/markets/fx/g10/e-micro-euro.contractSpecs.html)).
+      Set in `exchange_config.py`.
+- [x] **6J tick_size researched** (2026-07-10): CME contract spec — 0.0000005
+      JPY/USD (0.5 pip) = $6.25/tick
+      ([source](https://www.cmegroup.com/markets/fx/g10/japanese-yen.contractSpecs.html)).
+      Set in `exchange_config.py`.
+- [x] **M6A tick_size researched** (2026-07-10): CME contract spec — 0.0001 AUD =
+      $1.00/tick
+      ([source](https://www.cmegroup.com/markets/fx/g10/australian-dollar.contractSpecs.html)).
+      Set in `exchange_config.py`. Remaining 12 symbols still `None` — still TODO.
+- [ ] **Research TODO**: verify tick_size for the other 12 symbols against CME spec
+      sheets (`get_slippage()` raises for any symbol until its tick size is filled in,
+      `slippage_ticks=0` is the documented temporary workaround)
 - [ ] **Research TODO**: re-verify point values against CME specs directly (currently
       ported from a different codebase's `pointValues.ts`, not re-derived here)
-- [ ] **Research TODO**: Tradovate's real per-contract commission — no real number
-      sourced yet, `TradovateSymbolConfigProvider.default_fee_per_contract` defaults to
-      `0.0` as an explicit placeholder
+- [x] **MES/MNQ per-contract commission researched** (2026-07-10): Tradeify charges
+      $1.82 round-turn on both, explicitly named
+      ([source](https://proptradingvibes.com/blog/tradeify-commission-fees)). Set as
+      `fee_per_contract_override=0.91` (half the round-turn — `get_fee()` is charged
+      once per fill/side, not once per round trip) in `exchange_config.py`.
+- [x] **M2K/M6E/M6A per-contract commission assumed, not separately confirmed**
+      (2026-07-10): the same source describes $1.82 round-turn for "micro contracts
+      like MES and MNQ" but doesn't separately name these three. Set
+      `fee_per_contract_override=0.91` on the assumption the standard micro rate
+      applies — worth confirming against Tradeify's own pricing reference directly if
+      any of these three's numbers ever look off.
+- [x] **6J per-contract commission assumed, not separately confirmed** (2026-07-10):
+      6J is a full-size (not micro) contract; Tradeify's fee source gives
+      "standard contract" round-turn as ~$3.04-3.12 without naming 6J specifically.
+      Set `fee_per_contract_override=1.54` (the ~$3.08 midpoint, halved) as an
+      approximation — same caveat as above, worth confirming directly.
+      Remaining 12 symbols still use the `0.0` provider default — still TODO.
 
 ## Phase 2 — Exchange/Orders/Positions/Rebalancer integration
 
@@ -42,11 +79,23 @@ record across sessions.
       (default 5%), flag-and-halt semantics, real balance/equity never mutated)
 - [x] Unit tests: trailing-up on new EOD highs, breach detection, permanent halt across
       further day boundaries, day-1 seeding never itself breaches
-- [ ] **Open question, not yet resolved**: Tradeify's real drawdown mechanic may not be
-      purely EOD-trailing (some prop firms use intraday trailing, or a static/locked
-      threshold after reaching a profit target) — current implementation is the
-      confirmed-with-user EOD-trailing model; revisit against Tradeify's actual current
-      rulebook before relying on this for a real evaluation simulation
+- [x] **Rulebook researched** (2026-07-10, Tradeify Growth Evaluation, $50k account —
+      [source](https://help.tradeify.co/en/articles/10495897-rules-trailing-max-drawdowns),
+      [source](https://help.tradeify.co/en/articles/10495915-growth-evaluation-accounts)):
+      drawdown **is** EOD-trailing as implemented, confirming the earlier assumption —
+      but two mechanics aren't modeled yet:
+      - Real number for $50k is **$2,000 (4%)**, not this middleware's 5% default —
+        the notebook's own instantiation should pass `drawdown_percent=0.04`, though
+        the class default is left at 0.05 as a generic value (not itself wrong, just
+        not Tradeify-$50k-specific).
+      - **Trail locks** once EOD balance reaches `initial + drawdown + $100` (e.g.
+        $52,100 for a $50k/$2k account) — floor freezes there permanently
+        (e.g. $50,100) rather than continuing to trail upward. Not implemented:
+        `TradeifyDrawdownMiddleware` currently trails forever. See
+        `OPTIMIZATION_RESEARCH_PLAN.md` §7.1/§7.4 for the follow-up.
+      - Also confirmed: $3,000 profit target, $1,250 daily loss limit (soft
+        pause, not a hard fail — also not modeled), no consistency rule on Growth
+        specifically (Select uses a 40% rule instead — also not modeled).
 
 ## Phase 4 — Shared Mongo/Timescale fetch utility
 

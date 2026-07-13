@@ -88,7 +88,12 @@ class TradeifyDrawdownMiddleware(Middleware):
     once per calendar day (at the day boundary, using the *previous* day's final
     equity -- never checked intraday), compares that day's ending balance against a
     trailing threshold `highest_eod_balance_ever_reached * (1 - drawdown_percent)`. The
-    threshold only ever trails UP as new EOD highs are made, never down.
+    threshold trails UP as new EOD highs are made, never down -- until it *locks*:
+    Tradeify's real rule permanently freezes the floor at
+    `initial_balance + lock_grace_dollars` the first time EOD balance reaches
+    `initial_balance * (1 + drawdown_percent) + lock_grace_dollars` (confirmed for a
+    $50k Growth account: $2,000/4% drawdown locks at $52,100 EOD balance, floor frozen
+    at $50,100 forever after -- not verified across every account size/tier).
 
     On breach: flattens every open position, cancels every open order, sets
     account_failed=True, and halts permanently (skip_tick every tick from then on) --
@@ -96,22 +101,30 @@ class TradeifyDrawdownMiddleware(Middleware):
     never zeroed or altered, only trading is halted, so reporting/metrics stay
     accurate."""
 
-    def __init__(self, drawdown_percent: float = 0.05) -> None:
+    def __init__(self, drawdown_percent: float = 0.05, lock_grace_dollars: float = 100.0) -> None:
         """drawdown_percent: fraction (e.g. 0.05 = 5%) below the highest EOD balance
-        ever reached that triggers a permanent flatten-and-halt."""
+        ever reached that triggers a permanent flatten-and-halt, before the floor
+        locks. lock_grace_dollars: the fixed dollar buffer above the initial balance
+        the floor freezes at once locked (confirmed as $100 for Tradeify's $50k
+        Growth tier; left overridable since it hasn't been verified elsewhere)."""
         self.drawdown_percent = drawdown_percent
+        self.lock_grace_dollars = lock_grace_dollars
         self.account_failed: bool = False
+        self.locked: bool = False
         self._current_day: date | None = None
         self._last_balance_seen: float | None = None
+        self._initial_balance: float | None = None
         self._highest_eod_balance: float | None = None
         self._max_allowed_balance: float | None = None
+        self._lock_threshold: float | None = None
+        self._locked_floor: float | None = None
 
     def before_tick(self, bt: Backtester) -> None:
         """Once failed, keeps flattening/halting forever. Otherwise seeds the trailing
         high-water mark on the very first tick (so day 1 can never itself be a breach),
         then on every subsequent day boundary checks the previous day's final equity
-        (captured by after_tick) against the trailing threshold, trailing it up on a
-        new high or failing the account on a breach."""
+        (captured by after_tick) against the trailing threshold: trailing it up on a
+        new high (until it locks permanently), or failing the account on a breach."""
         if self.account_failed:
             bt.exchange.positions.close_all_open_positions()
             bt.exchange.orders.cancel_open_orders()
@@ -122,8 +135,13 @@ class TradeifyDrawdownMiddleware(Middleware):
 
         if self._current_day is None:
             self._current_day = current_day
-            self._highest_eod_balance = bt.exchange.get_asset_total_in_usd()
+            self._initial_balance = bt.exchange.get_asset_total_in_usd()
+            self._highest_eod_balance = self._initial_balance
             self._max_allowed_balance = self._highest_eod_balance * (1 - self.drawdown_percent)
+            self._lock_threshold = (
+                self._initial_balance * (1 + self.drawdown_percent) + self.lock_grace_dollars
+            )
+            self._locked_floor = self._initial_balance + self.lock_grace_dollars
             return
 
         if current_day != self._current_day:
@@ -131,6 +149,8 @@ class TradeifyDrawdownMiddleware(Middleware):
             assert eod_balance is not None
             assert self._max_allowed_balance is not None
             assert self._highest_eod_balance is not None
+            assert self._lock_threshold is not None
+            assert self._locked_floor is not None
 
             if eod_balance <= self._max_allowed_balance:
                 self.account_failed = True
@@ -139,7 +159,13 @@ class TradeifyDrawdownMiddleware(Middleware):
                 bt.skip_tick()
             else:
                 self._highest_eod_balance = max(self._highest_eod_balance, eod_balance)
-                self._max_allowed_balance = self._highest_eod_balance * (1 - self.drawdown_percent)
+                if not self.locked and self._highest_eod_balance >= self._lock_threshold:
+                    self.locked = True
+                self._max_allowed_balance = (
+                    self._locked_floor
+                    if self.locked
+                    else self._highest_eod_balance * (1 - self.drawdown_percent)
+                )
 
             self._current_day = current_day
 

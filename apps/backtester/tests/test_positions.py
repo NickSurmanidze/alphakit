@@ -201,6 +201,40 @@ class TestBugFixRegressions:
         assert len(exchange.positions.closed_positions) == 2
 
 
+class TestClosingDoesNotReRequireMargin:
+    def test_close_position_succeeds_at_full_margin_commitment(self):
+        # Regression test: validate_order_before_creating used to hardcode
+        # side=PositionSide.long when computing required margin, regardless of the
+        # order's actual side. A SELL order closing a LONG position was therefore
+        # evaluated as if it were opening a fresh new long (order.side's true meaning
+        # discarded, side==position.side skips the opposite-side netting branch in
+        # calculate_required_margin), demanding a second helping of margin instead of
+        # freeing the first. This never surfaced with typical position sizing (plenty
+        # of free-margin headroom to absorb the miscounted demand); a highly-levered,
+        # fully-margined position exposes it directly.
+        market = build_market(
+            {"BTC/USD": [{"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0}] * 2}
+        )
+        exchange = make_exchange(market, max_leverage=5)
+        exchange.transactions.add_deposit(asset="USD", volume=10_000)
+        # notional = 500 * 100 = 50,000; margin = 50,000 / 5 = 10,000 -- exactly all
+        # of the account's free balance, zero left over.
+        exchange.orders.create_order(
+            symbol="BTC/USD",
+            side=OrderSide.buy,
+            execution_type=OrderExecutionType.market,
+            volume=500,
+        )
+        assert exchange.balance.get_balance()["USD"]["free"]["volume"] == pytest.approx(0.0)
+
+        position = exchange.positions.get_open_position_by_symbol("BTC/USD")
+        exchange.positions.close_position(position)  # must not raise
+
+        assert exchange.positions.get_open_position_by_symbol("BTC/USD") is None
+        # Full margin freed, no PnL (price never moved).
+        assert exchange.balance.get_balance()["USD"]["free"]["volume"] == pytest.approx(10_000.0)
+
+
 class TestCloseErrors:
     def test_close_position_raises_when_symbol_not_open(self):
         market = build_market(

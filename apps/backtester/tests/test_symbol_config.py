@@ -60,6 +60,18 @@ class TestGetSlippage:
             provider.get_slippage("XX", position_size=1)
 
 
+class TestGetMaxPositionSize:
+    def test_none_by_default(self):
+        provider = TradovateSymbolConfigProvider(symbols={"ES": SymbolConfig(point_value=50)})
+        assert provider.get_max_position_size("ES") is None
+
+    def test_returns_configured_ceiling(self):
+        provider = TradovateSymbolConfigProvider(
+            symbols={"MES": SymbolConfig(point_value=5, max_position_size=1.0)}
+        )
+        assert provider.get_max_position_size("MES") == 1.0
+
+
 class TestOtherLookups:
     def test_point_value_min_size_min_step(self):
         provider = TradovateSymbolConfigProvider(

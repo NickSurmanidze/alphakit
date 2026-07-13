@@ -45,16 +45,24 @@ class Portfolio:
     def merge_allocation(self) -> None:
         """Recomputes `self.merged_allocation` from every weighted strategy's own
         allocation, netting opposite-side positions on the same symbol (see
-        _net_positions)."""
+        _net_positions). Positions/orders are ordered by each symbol's priority (see
+        _symbol_priority) rather than dict/set iteration order, so a Rebalancer that
+        processes `merged_allocation.positions` in list order (e.g. to size
+        higher-priority signals first when leveraged margin can't fit everything) gets
+        a deterministic, caller-controlled order -- not one that depends on incidental
+        Python hashing."""
         long_pos, long_ord = self._collect_sides(PositionSide.long, OrderSide.sell)
         short_pos, short_ord = self._collect_sides(PositionSide.short, OrderSide.buy)
         merged_pos, merged_ord = self._net_positions(long_pos, long_ord, short_pos, short_ord)
 
+        priority = self._symbol_priority()
+        ordered_symbols = sorted(merged_pos, key=lambda symbol: priority.get(symbol, len(priority)))
+
         allocation = Allocation()
-        for symbol in merged_pos:
+        for symbol in ordered_symbols:
             allocation.positions.append(merged_pos[symbol])
-        for symbol in merged_ord:
-            allocation.orders.extend(merged_ord[symbol])
+        for symbol in ordered_symbols:
+            allocation.orders.extend(merged_ord.get(symbol, []))
         self.merged_allocation = allocation
 
     def refresh_exposures(self) -> None:
@@ -155,6 +163,16 @@ class Portfolio:
                 # equal long/short → flat, no position
 
         return merged_pos, merged_ord
+
+    def _symbol_priority(self) -> dict[str, int]:
+        """Maps each symbol to the index of the first weighted_strategies entry that
+        trades it -- index 0 is highest priority. This makes "top of the
+        weighted_strategies list" a well-defined, caller-controlled priority order
+        (reorder the list to change it) rather than an incidental one."""
+        priority: dict[str, int] = {}
+        for index, ws in enumerate(self.weighted_strategies):
+            priority.setdefault(ws.strategy.symbol, index)
+        return priority
 
     def _get_signal_allocation_change_time_hash(self) -> str:
         """Hashes every strategy's last allocation-change timestamp -- used by refresh()

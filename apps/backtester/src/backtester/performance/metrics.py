@@ -68,6 +68,36 @@ def sortino_ratio(
     return float(np.sqrt(periods_per_year) * mean / downside_std)
 
 
+def sharpe_lower_bound(
+    returns: pd.Series,
+    periods_per_year: int = _PERIODS_PER_YEAR,
+    risk_free_rate: float = 0.0,
+    z: float = 1.0,
+) -> float:
+    """A conservative (lower-confidence-bound) Sharpe estimate that penalizes small
+    sample sizes -- Lo (2002)'s asymptotic standard error under an iid-returns
+    assumption (ignoring the skew/kurtosis correction terms of the fuller Mertens 2002
+    version): SE(SR) ~= sqrt((1 + SR^2/2) / n), n = len(returns).
+
+    Ranking candidates by this instead of the raw point-estimate Sharpe stops a lucky
+    small sample from outranking a larger one with a slightly lower Sharpe -- e.g. two
+    parameter sets with near-identical Sharpe where one is backed by 4x the
+    observations should not be treated as equivalent. `returns` need not be one row
+    per calendar period: pass one row per closed trade (with `periods_per_year` set to
+    the strategy's trades/year) to get a confidence bound driven by trade count
+    specifically, rather than by how long the backtest window happens to be.
+
+    Returns 0.0 for fewer than 2 observations.
+    """
+    clean = returns.dropna()
+    n = len(clean)
+    if n < _MIN_OBSERVATIONS_FOR_ALIGNMENT:
+        return 0.0
+    sr = sharpe_ratio(clean, risk_free_rate, periods_per_year)
+    se = np.sqrt((1 + sr**2 / 2) / n) * np.sqrt(periods_per_year)
+    return float(sr - z * se)
+
+
 def annualized_volatility(
     returns: pd.Series,
     periods_per_year: int = _PERIODS_PER_YEAR,

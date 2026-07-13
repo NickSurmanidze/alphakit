@@ -31,13 +31,26 @@ class Exchange:
         margin_allocation_type: MarginAllocationType = MarginAllocationType.isolated,
         event_log_enabled: bool = True,
         symbol_config_provider: SymbolConfigProvider | None = None,
+        leverage_aware_sizing: bool = False,
     ):
         """Builds fresh Balance/Transactions/Orders/Positions/EventLog sub-objects bound
         to this exchange instance. `symbol_config_provider`, when set, switches fee/
         slippage/margin/PnL math from the crypto percentage-of-price model to an
         absolute, per-symbol one (point value, tick-based slippage, per-contract fees) --
         see Orders.add_order_processing_logic() and get_point_value()/
-        round_position_size() below for exactly where it plugs in."""
+        round_position_size() below for exactly where it plugs in.
+
+        `leverage_aware_sizing`: whether Rebalancer.rebalance() multiplies its sizing
+        formula by `max_leverage` (True: `max_leverage=5` -> up to 5x notional per unit
+        of allocated equity-percent, i.e. real buying-power leverage) or leaves position
+        sizing unleveraged 1x notional regardless of `max_leverage`, which then only acts
+        as a margin-call buffer (False, the default). Defaults to False because every
+        existing caller (including the golden tests, which use `max_leverage=10` purely
+        as margin headroom around `MaCrossoverStrategy`'s `percent=1` sizing) already
+        assumes the unleveraged behavior -- changing the default would silently 10x their
+        position sizes. Opt in explicitly where real leveraged sizing is wanted (e.g.
+        splitting one account's equity across several simultaneous strategies where each
+        needs more than an unleveraged equity-fraction can buy)."""
         self.market: Market = market
         self.slippage: float = slippage
         self.maker_fee: float = maker_fee
@@ -46,6 +59,7 @@ class Exchange:
         self.max_leverage: int = max_leverage
         self.margin_allocation_type: MarginAllocationType = margin_allocation_type
         self.symbol_config_provider: SymbolConfigProvider | None = symbol_config_provider
+        self.leverage_aware_sizing: bool = leverage_aware_sizing
 
         self.logs: list[Log] = []
         self.event_log = EventLog(enabled=event_log_enabled)
@@ -91,14 +105,22 @@ class Exchange:
         """Rounds `volume` down to `symbol`'s min_order_step (whole contracts, for
         futures), returning 0.0 if the floored size is below its min_position_size --
         never forces a minimum-size trade that would exceed the intended allocation.
-        No-op (returns `volume` unchanged) unless symbol_config_provider is set."""
+        Then clamps to max_position_size, if the symbol has one -- a hard ceiling
+        independent of whatever the percent-of-equity sizing formula asked for (see
+        SymbolConfig.max_position_size for why that formula alone isn't trustworthy as
+        equity compounds). No-op (returns `volume` unchanged) unless
+        symbol_config_provider is set."""
         if self.symbol_config_provider is None:
             return volume
         asset, _quote = symbol.split("/")
         step = self.symbol_config_provider.get_min_order_step(asset)
         min_size = self.symbol_config_provider.get_min_position_size(asset)
         floored = math.floor(volume / step) * step
-        return floored if floored >= min_size else 0.0
+        rounded = floored if floored >= min_size else 0.0
+        max_size = self.symbol_config_provider.get_max_position_size(asset)
+        if max_size is not None:
+            rounded = min(rounded, max_size)
+        return rounded
 
     def get_market_candle(self, symbol: str):
         """Returns the full current candle dict (OHLC + indicators) for `symbol`."""

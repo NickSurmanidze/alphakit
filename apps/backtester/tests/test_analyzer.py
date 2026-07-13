@@ -209,6 +209,48 @@ class TestRMultipleAndDollarMetricsInSummary:
         assert "dollar_expectancy" in summary
 
 
+class TestSummaryDataframe:
+    def test_empty_before_generate_report(self):
+        market = build_market(
+            {"BTC/USD": [{"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0}]}
+        )
+        analyzer = PerformanceAnalyzer(market=market, benchmark_symbols=[])
+        assert analyzer.summary_dataframe().empty
+
+    def test_one_row_per_metric_one_column_per_key(self):
+        # 2 days of hourly candles with a real price move on day 2, so returns/Sharpe
+        # aren't degenerate (a single-day or flat scenario leaves sharpe_ratio's inputs
+        # empty/NaN after dropna(), which isn't what this test is about).
+        candles = [{"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0}] * 24
+        candles += [{"open": 100.0, "high": 100.0, "low": 100.0, "close": 110.0}] * 24
+        market = build_market({"BTC/USD": candles})
+        exchange = make_exchange(market, max_leverage=1)
+        exchange.transactions.add_deposit(asset="USD", volume=1000)
+        analyzer = PerformanceAnalyzer(
+            market=market, exchange=exchange, benchmark_symbols=["BTC/USD"]
+        )
+        analyzer.take_snapshot()
+        for _ in range(47):
+            market.set_next_candle_as_current_market()
+            exchange.run_step()
+            analyzer.take_snapshot()
+
+        analyzer.generate_report()
+        df = analyzer.summary_dataframe()
+
+        assert list(df.columns) == ["algo", "BTC/USD"]
+        assert df.index.name == "metric"
+        assert "sharpe_ratio" in df.index
+        # algo has keys BTC/USD doesn't (e.g. dollar_profit_factor) -- those show up as
+        # NaN for the benchmark column rather than raising or being dropped.
+        assert "dollar_profit_factor" in df.index
+        assert pd.isna(df.loc["dollar_profit_factor", "BTC/USD"])
+        # rounded to 4dp in the table, so compare with a matching tolerance
+        assert df.loc["sharpe_ratio", "algo"] == pytest.approx(
+            analyzer.summary["algo"]["sharpe_ratio"], abs=1e-4
+        )
+
+
 class TestBetaCorrelationAlphaInSummary:
     def test_beta_correlation_alpha_keys_present_per_benchmark(self):
         candles = [
