@@ -27,16 +27,24 @@ interface WorkerSpec {
   lockDuration?: number;
 }
 
+// Unlike Binance/Yahoo, Databento's Historical API meters and bills by bytes scanned per query --
+// kept deliberately more conservative than Binance/Yahoo's concurrency (not rate-limit-driven
+// like IB, just cost-conscious) so a big backfill batch can't fan out into a large parallel bill.
+const DATABENTO_CONCURRENCY = 3;
+
 const WORKER_SPECS: WorkerSpec[] = [
   { queue: Queues.MARKET_DATA_LIVE_BINANCE, concurrency: 10 },
   { queue: Queues.MARKET_DATA_LIVE_YAHOO, concurrency: 10 },
   { queue: Queues.MARKET_DATA_LIVE_IB, concurrency: 5, lockDuration: IB_LOCK_DURATION_MS },
+  { queue: Queues.MARKET_DATA_LIVE_DATABENTO, concurrency: DATABENTO_CONCURRENCY },
   { queue: Queues.MARKET_DATA_HISTORICAL_BINANCE, concurrency: 10 },
   { queue: Queues.MARKET_DATA_HISTORICAL_YAHOO, concurrency: 10 },
   { queue: Queues.MARKET_DATA_HISTORICAL_IB, concurrency: 3, lockDuration: IB_LOCK_DURATION_MS },
+  { queue: Queues.MARKET_DATA_HISTORICAL_DATABENTO, concurrency: DATABENTO_CONCURRENCY },
   { queue: Queues.MARKET_DATA_GAPS_BINANCE, concurrency: 2 },
   { queue: Queues.MARKET_DATA_GAPS_YAHOO, concurrency: 2 },
-  { queue: Queues.MARKET_DATA_GAPS_IB, concurrency: 2 }
+  { queue: Queues.MARKET_DATA_GAPS_IB, concurrency: 2 },
+  { queue: Queues.MARKET_DATA_GAPS_DATABENTO, concurrency: 2 }
 ];
 
 // Returns the created workers so the caller can close them as part of one coordinated shutdown

@@ -272,6 +272,56 @@ def _base_metric_id(metric_name: str) -> str:
     return match.group(1) if match else metric_name
 
 
+# Row-label-only (display concern, not a metrics concern) -- an emoji + plain-English
+# name per metric id so the table reads at a glance without decoding snake_case.
+# Keyed by the same base metric id as METRIC_SPECS; falls back to the raw metric_name
+# for anything not yet mapped here (e.g. a newly added metric).
+_DISPLAY_NAMES: dict[str, str] = {
+    "gross_return_percent": "🏦 Gross Return %",
+    "net_return_percent": "💰 Net Return %",
+    "max_drawdown_percent": "📉 Max Drawdown %",
+    "max_drawdown_duration_days": "⏱️ Max Drawdown Duration (days)",
+    "sharpe_ratio": "📊 Sharpe Ratio",
+    "sortino_ratio": "📊 Sortino Ratio",
+    "annualized_volatility_percent": "🌪️ Annualized Volatility %",
+    "cagr_percent": "📈 CAGR %",
+    "calmar_ratio": "📐 Calmar Ratio",
+    "recovery_factor": "🔁 Recovery Factor",
+    "ulcer_index": "🤢 Ulcer Index",
+    "var_95_percent": "⚠️ VaR (95%)",
+    "cvar_95_percent": "⚠️ CVaR (95%)",
+    "returns_skewness": "↔️ Returns Skewness",
+    "returns_kurtosis": "🎯 Returns Kurtosis",
+    "profit_factor": "⚖️ Profit Factor",
+    "dollar_profit_factor": "💵 Dollar Profit Factor",
+    "dollar_expectancy": "💵 Dollar Expectancy",
+    "win_rate_percent": "🎯 Win Rate %",
+    "avg_win_loss_ratio": "⚖️ Avg Win/Loss Ratio",
+    "r_multiple_expectancy": "🎲 R-Multiple Expectancy",
+    "max_consecutive_losses": "🔻 Max Consecutive Losses",
+    "avg_holding_period_min": "⏳ Avg Holding Period (min)",
+    "time_in_market_percent": "🕒 Time in Market %",
+    "closed_trades": "🔢 Closed Trades",
+    "winner_trades": "✅ Winner Trades",
+    "loser_trades": "❌ Loser Trades",
+    "beta": "📡 Beta",
+    "correlation": "🔗 Correlation",
+    "alpha_percent": "🚀 Alpha %",
+}
+
+
+def _display_label(metric_name: str) -> str:
+    """Emoji + plain-English row label for `metric_name`. Preserves a "_vs_{symbol}"
+    suffix (which benchmark a beta/correlation/alpha row is against) as " vs {symbol}"
+    rather than dropping it -- that part is meaningful, unlike the base metric id."""
+    base_id = _base_metric_id(metric_name)
+    label = _DISPLAY_NAMES.get(base_id, metric_name)
+    match = _VS_SYMBOL_RE.match(metric_name)
+    if match:
+        label += f" vs {match.group(0)[len(base_id) + len('_vs_'):]}"
+    return label
+
+
 def _format_value(metric_name: str, value: float) -> str:
     if pd.isna(value):
         return "—"
@@ -313,12 +363,15 @@ def render_summary_html(df: pd.DataFrame) -> str:
                 band = band_fn(value) if band_fn else None
                 if band:
                     style += f"background-color:{_BAND_COLORS[band]};"
-                    if band == "great":
-                        style += "color:#ffffff;"
+                    # Pastel bands (good/bad/caution) need dark text forced -- an
+                    # inherited color (e.g. a notebook's light-gray default) can be
+                    # unreadable against them. "great" uses a deeper, saturated
+                    # green, so it needs white instead.
+                    style += "color:#ffffff;" if band == "great" else "color:#1a1a1a;"
                 if col == best_col:
                     style += _WINNER_BORDER
                     if not band:
-                        style += f"background-color:{_GOOD};"
+                        style += f"background-color:{_GOOD};color:#1a1a1a;"
             cells.append(f'<td style="{style}">{_format_value(str(metric_name), value)}</td>')
 
         cells.append(
@@ -326,7 +379,7 @@ def render_summary_html(df: pd.DataFrame) -> str:
             f"{description}</td>"
         )
         body_rows.append(
-            f'<tr><th style="{_CELL_STYLE}text-align:left;">{html.escape(str(metric_name))}</th>'
+            f'<tr><th style="{_CELL_STYLE}text-align:left;">{html.escape(_display_label(str(metric_name)))}</th>'
             f"{''.join(cells)}</tr>"
         )
 

@@ -224,3 +224,172 @@ basis, not the actual odds of blowing the account or the actual dollars it makes
 `max_position_size` feature). All 8 changed notebooks (6 step_2 + combined +
 monte_carlo) re-executed end-to-end against the live Mongo/Timescale DB with zero
 errors.
+
+## Status (2026-07-13): MES moves off Mongo/Timescale onto Databento's full history, new winner found (KAMA/session-VWAP)
+
+**Data source switch, MES only so far**: the Mongo/Timescale IB feed only ever had
+~1 year of real MES history despite `DATE_FROM`/`DATE_TO` implying ~6.7 years -- every
+MES result above is *this pass's best defensible answer given that ~1-year
+shortfall*, not a validated edge. Fixed by adding a whole new data source,
+Databento (`GLBX.MDP3`, `MES.c.0` continuous front-month contract):
+
+- **New app-level integration** (`apps/trading-system-backend`): `databento`
+  connector implementing `MarketDataConnector` (registry/queues/env wiring, HTTP
+  Basic auth against Databento's Historical REST API since there's no official
+  Node client), handles the API's own ingestion-lag/licensing-delay 422s by
+  clamping `end` to the server-reported `available_end` and retrying.
+- **New backtester tooling** (`apps/backtester/src/data_aggregator/databento_aggregator.py`):
+  downloads full-history 1-minute OHLCV to a local Parquet
+  (`apps/backtester/datasets/databento/MES_c_0_1m.parquet`, gitignored), with a
+  mandatory cost estimate (`metadata.get_cost`, the same endpoint Databento's own
+  billing uses) and interactive confirmation before spending anything -- full MES
+  1-minute history cost **$9.16**, one-time. `load_1m_parquet_resampled()` resamples
+  to any bucket size (dropping non-trading buckets, not leaving them as NaN/zero-
+  volume rows a plain calendar-grid resample would).
+  **To reproduce**: `cd apps/backtester && DATABENTO_API_KEY=... uv run python -m
+  data_aggregator.databento_aggregator` (prints the cost, waits for `y` before
+  downloading).
+- Real MES history is now **2019-05-05 onward** (the contract's actual launch date)
+  through whenever the Parquet was last downloaded -- genuinely ~7.2 years, not ~1.
+
+**`step_1_find_best_indicators_and_parameters.ipynb` re-run against the full
+history** (1h bars resampled from the 1-minute Parquet): winner changed from
+KAMA(26)/SMA(42) (found on ~1 year of data) to **KAMA(fast=42)/SMA(slow=132)**,
+`trade_sharpe_lb=+0.554` (was +0.04 on the ~1-year window -- a much stronger,
+more defensible number). Two further passes added to this same notebook (not new
+notebooks):
+
+1. **Experiment 5 (KAMA/KAMA, both lines adaptive) + a heatmap over KAMA's own
+   `fast`/`slow` EMA smoothing constants + a fine independent re-scan of KAMA's
+   `length`**: all confirmatory, not corrective -- KAMA/KAMA came close
+   (`trade_sharpe_lb=+0.506`) but didn't beat KAMA/SMA; Kaufman's own textbook
+   defaults (`fast=2, slow=30`) turned out to already be the best of 41 tested
+   combinations; the fine length re-scan found nothing better than `42` in a
+   71-point scan. **An ADX trend-strength filter made every tested combination
+   worse** (down to negative `trade_sharpe_lb` at the strictest thresholds) --
+   traced directly to the filter forcing exit/re-entry on every choppy ADX
+   reading (158 -> 320-558 trades), not a lack of edge in the underlying signal.
+2. **Experiments 6-7: KAMA vs. session VWAP (new indicator, `Indicators.vwap_session`
+   -- originally built for the separate mean-reversion pipeline below, reused
+   here), both orderings**: **KAMA(fast=34)/session-VWAP(slow) beat the incumbent**,
+   `trade_sharpe_lb=+0.575` -- the best number found anywhere in this notebook.
+   VWAP has no `length` of its own (session-anchored, not a rolling window), so
+   only KAMA's length varies; the reverse ordering (VWAP as the fast line) was
+   clearly worse (`+0.421` best case). Out-of-sample check (75/25 train/test) came
+   back genuinely strong, not just a good full-period number: **test-slice Sharpe
+   (1.564) higher than train (0.874)**, test drawdown (-12.2%) less than half of
+   train's (-25.6%) -- the opposite shape of a curve-fit result.
+
+**`step_2_run_full_backtest.ipynb` updated to match, and re-verified through the
+real event-driven engine (not just the vectorized numbers above)**:
+KAMA(34)/session-VWAP beat KAMA(42)/SMA(132) for real, not just on paper --
+Sharpe **0.84** (vs ~0.71-0.73), net return **106.5%** (vs ~80-83%), max drawdown
+**-11.4%** (similar, and notably *better* than its own -25.6% frictionless
+prediction), win rate 72.1% (vs ~50%), no drawdown-middleware breach, floor
+locked. Trades far more often (821 vs 158 over the same period, ~114/year vs
+~22/year) -- the turnover risk that raised was a legitimate thing to check, and
+the real engine (real Tradovate fees, real position sizing/margin) confirms it
+holds up rather than being quietly eaten by costs. **New engine feature enabling
+this check**: `PerformanceAnalyzer.summary_html_table(split="Y"|"Q")` -- year-
+by-year (or quarter-by-quarter) performance columns alongside the usual
+whole-period one, which showed no single disastrous year (worst is 2022, roughly
+flat at CAGR -1.7%) rather than one blow-up year hiding inside a good aggregate
+number.
+
+**Current MES parameters** (`step_2_run_full_backtest.ipynb`):
+`KAMA_FAST_LEN=34`, `KAMA_EMA_FAST=2`, `KAMA_EMA_SLOW=30`, slow line = session VWAP
+(no length), `sl_percent=0.025`, `tp_percent=0.07` (carried over unchanged from the
+old KAMA/SMA pick -- **not yet re-derived for this candidate's much shorter real
+holding period**, a known gap, not an oversight). Tradeify drawdown/daily-loss
+middleware deliberately loosened to 50%/50% in this notebook (real limits are
+4%/2.5%) since it tests one strategy sleeve in isolation ahead of eventual
+multi-strategy combination -- re-tighten once combined with others, same as the
+existing convention documented in that notebook's own cells.
+
+**Separate mean-reversion pipeline exploration** (`notebooks/pipelines/mean-reversion/`,
+not this pipeline, but the new `Indicators.vwap_session`/`VwapMeanReversionStrategy`
+backtester additions came from here first): VWAP deviation-band mean reversion on
+MES, entry_std/exit_std grid up to a 21-combo search -- **did not find a profitable
+corner**. First pass (tight 1.5-2.5 std bands) lost badly to fee drag from
+overtrading (5,479 trades, $16,851 in real commissions against a +$1,232 raw
+edge); widening bands fixed the fee problem but exposed that the raw pre-fee edge
+itself goes negative once bands are wide enough to control turnover -- a
+structural finding, not a tuning problem. Documented for completeness since the
+indicator/strategy code it produced ended up valuable for *this* pipeline instead.
+
+**Verification**: 212/212 backtester tests pass (192 -> 212, +20 across the
+Databento connector/aggregator, `Indicators.vwap_session`/`adx`,
+`VwapMeanReversionStrategy`, and `PerformanceAnalyzer`'s period-split feature).
+Both notebooks re-executed end-to-end against the real Databento Parquet with zero
+errors.
+
+## Status (2026-07-13, later same day): 1-minute candle attempt -- negative finding, transaction costs make genuine intraday MA-crossover unviable on MES
+
+Goal was to switch `step_1`/`step_2` to 1-minute bars specifically to find a
+crossover pair whose real holding period is minutes-to-a-few-hours (the KAMA/VWAP
+winner above, while a real improvement, still only trades ~114/year -- multi-day
+holds, not intraday). Result: **a real, structural negative finding, not a bug**.
+
+**What was tried**: `step_1`'s data cell switched to load the Databento Parquet at
+native 1-minute resolution (`UNIT_OF_TIME="minute"`, same numeric
+`long_len_range`/`short_len_range` left unchanged on purpose -- at 1-minute
+granularity `range(2, 300, 10)`/`range(2, 60, 4)` mean 2-300 *minutes* / 2-60
+*minutes*, i.e. exactly the few-minutes-to-a-few-hours zone being targeted). First
+two full re-executions **crashed** (`IndexError`/`KeyError`) because every single
+experiment -- KAMA/SMA, EMA/SMA, HMA/SMA, DEMA/SMA, KAMA/KAMA, KAMA/VWAP both
+orderings -- came back with **zero** combinations clearing the
+`total_return > 0 and trades >= MIN_TRADES` bar at 1-minute resolution, and the
+"pick the winner" cells did `.iloc[0]` on the resulting empty frames. Added a
+shared `pick_best_or_fallback()` helper (falls back to the unfiltered argmax with
+a loud printed warning instead of crashing) so a single all-unprofitable
+experiment can't block the rest of the notebook from running -- kept, since it's
+a real robustness improvement independent of this finding.
+
+**Root cause, confirmed with a standalone diagnostic script** (same cost model as
+`evaluate_signal()`: 1 tick slippage + $0.91/side commission, ~$4.32/round-trip
+on MES):
+
+| Setup | Gross return | Net return | Trades/yr |
+|---|---|---|---|
+| KAMA(34)/SMA(132), lengths in minutes | +107% | **-77%** | 1,536 |
+| KAMA(34)/VWAP, lengths in minutes | +109% | **-46%** | 933 |
+| KAMA(120m=2h)/SMA(480m=8h) | +75% | **-8%** | 443 |
+| KAMA(2040m=34h)/SMA(7920m=132h) -- same *time* as the existing hourly winner | +89% | **+77%** | 47 |
+
+The underlying trend edge is real (gross return strongly positive at every
+lookback tested) but MES's fixed per-trade cost is large relative to the price
+move a crossover captures within an intraday window, so every genuinely-intraday
+parameterization loses money net of costs -- only stretching the lookback back
+out to multi-day territory (reproducing the existing hourly winner almost
+exactly, ~1 trade/week) survives. **Also tried layering the ADX trend filter
+(already built for the hourly notebook) on top of intraday lengths, hoping it
+would cut whipsaw trades**: it made things dramatically worse instead (trade
+count exploded to 3,000-30,000/year across every length/threshold combination
+tested) -- ADX itself whipsaws across its threshold at 1-minute granularity,
+forcing extra forced-flat/re-entry round-trips on top of the crossover's own
+signal changes, the opposite of the intended effect.
+
+This is the same fee-drag mechanism already found in the separate mean-reversion
+pipeline above (overtrading eating a real raw edge), now confirmed for the
+crossover family too: **simple MA-crossover signals do not survive realistic
+Tradeify/Tradovate costs at intraday MES trade frequencies**, regardless of
+which indicator pair or trend filter is layered on top. Genuinely intraday
+(minutes-to-hours) MES trading would need either materially lower per-trade
+costs, or a fundamentally different signal mechanic (e.g. a minimum-holding-period
+lockout, a wider dead-zone/hysteresis band before re-entry, or a breakout/target-
+based approach rather than continuous crossover-driven position flips) --
+deliberately not attempted this pass; decided to stop and document rather than
+keep guessing at mitigations.
+
+**Current state of the notebooks**: `step_1_find_best_indicators_and_parameters.ipynb`
+still has its data cell set to `UNIT_OF_TIME="minute"` and the new
+`pick_best_or_fallback()` guard, but was **not** re-executed to a clean completion
+after this finding -- most of its cell outputs are stale artifacts left over from
+the last successful **hourly** run before the switch, not real 1-minute results
+(only the standalone diagnostic script's numbers above are trustworthy for the
+1-minute case). `step_2_run_full_backtest.ipynb` was **not touched** and still
+reflects the hourly KAMA(34)/session-VWAP winner documented in the entry above --
+that remains the current best validated candidate. Anyone picking this back up
+should either revert `step_1`'s `UNIT_OF_TIME` to `"hour"` to get back to a clean,
+fully-consistent notebook, or deliberately re-run it at 1-minute resolution
+knowing the likely outcome, before trying one of the mitigations above.

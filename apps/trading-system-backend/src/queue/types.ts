@@ -14,28 +14,34 @@ export enum Queues {
   MARKET_DATA_LIVE_BINANCE = 'market-data-live-binance-queue',
   MARKET_DATA_LIVE_YAHOO = 'market-data-live-yahoo-queue',
   MARKET_DATA_LIVE_IB = 'market-data-live-ib-queue',
+  MARKET_DATA_LIVE_DATABENTO = 'market-data-live-databento-queue',
   MARKET_DATA_HISTORICAL_BINANCE = 'market-data-historical-binance-queue',
   MARKET_DATA_HISTORICAL_YAHOO = 'market-data-historical-yahoo-queue',
   MARKET_DATA_HISTORICAL_IB = 'market-data-historical-ib-queue',
+  MARKET_DATA_HISTORICAL_DATABENTO = 'market-data-historical-databento-queue',
   MARKET_DATA_GAPS_BINANCE = 'market-data-gaps-binance-queue',
   MARKET_DATA_GAPS_YAHOO = 'market-data-gaps-yahoo-queue',
-  MARKET_DATA_GAPS_IB = 'market-data-gaps-ib-queue'
+  MARKET_DATA_GAPS_IB = 'market-data-gaps-ib-queue',
+  MARKET_DATA_GAPS_DATABENTO = 'market-data-gaps-databento-queue'
 }
 
 const LIVE_QUEUE_BY_SOURCE: Record<InstrumentSource, Queues> = {
   binance: Queues.MARKET_DATA_LIVE_BINANCE,
   yahoo: Queues.MARKET_DATA_LIVE_YAHOO,
-  ib: Queues.MARKET_DATA_LIVE_IB
+  ib: Queues.MARKET_DATA_LIVE_IB,
+  databento: Queues.MARKET_DATA_LIVE_DATABENTO
 };
 const HISTORICAL_QUEUE_BY_SOURCE: Record<InstrumentSource, Queues> = {
   binance: Queues.MARKET_DATA_HISTORICAL_BINANCE,
   yahoo: Queues.MARKET_DATA_HISTORICAL_YAHOO,
-  ib: Queues.MARKET_DATA_HISTORICAL_IB
+  ib: Queues.MARKET_DATA_HISTORICAL_IB,
+  databento: Queues.MARKET_DATA_HISTORICAL_DATABENTO
 };
 const GAPS_QUEUE_BY_SOURCE: Record<InstrumentSource, Queues> = {
   binance: Queues.MARKET_DATA_GAPS_BINANCE,
   yahoo: Queues.MARKET_DATA_GAPS_YAHOO,
-  ib: Queues.MARKET_DATA_GAPS_IB
+  ib: Queues.MARKET_DATA_GAPS_IB,
+  databento: Queues.MARKET_DATA_GAPS_DATABENTO
 };
 
 export const liveQueueFor = (source: InstrumentSource): Queues => LIVE_QUEUE_BY_SOURCE[source];

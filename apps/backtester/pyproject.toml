@@ -40,6 +40,7 @@ dependencies = [
   "types-requests>=2.32.4.20250913",
   "multiprocess>=0.70.18",
   "seaborn>=0.13.2",
+  "databento>=0.81,<1.0",
 ]
 
 [project.optional-dependencies]

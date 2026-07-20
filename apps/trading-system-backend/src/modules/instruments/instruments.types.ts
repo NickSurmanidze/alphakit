@@ -1,6 +1,6 @@
 import { ObjectId } from 'mongodb';
 
-export type InstrumentSource = 'binance' | 'yahoo' | 'ib';
+export type InstrumentSource = 'binance' | 'yahoo' | 'ib' | 'databento';
 export type AssetClass = 'spot' | 'perpetual' | 'equity' | 'future' | 'index' | 'forex';
 export type BaseResolution = '1_minute' | '5_minute' | '1_hour' | '1_day';
 export type InstrumentStatus = 'pending' | 'inProgress' | 'finished';

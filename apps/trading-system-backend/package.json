@@ -13,6 +13,7 @@
     "test:watch": "vitest",
     "seed:user": "tsx scripts/seed-user.ts",
     "seed:calendars": "tsx scripts/seed-calendars.ts",
+    "seed:mes": "tsx scripts/seed-mes-instrument.ts",
     "migrate:timescale": "tsx scripts/migrate-timescale.ts",
     "migrate:instruments": "tsx scripts/migrate-instruments-resolutions.ts",
     "migrate:point-values": "tsx scripts/backfill-point-values.ts"

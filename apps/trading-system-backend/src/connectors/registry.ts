@@ -1,5 +1,6 @@
 import { InstrumentSource } from '../modules/instruments/instruments.types.js';
 import { binanceConnector } from './binance/binanceConnector.js';
+import { databentoConnector } from './databento/databentoConnector.js';
 import { ibConnector } from './ib/ibConnector.js';
 import { MarketDataConnector } from './types.js';
 import { yahooConnector } from './yahoo/yahooConnector.js';
@@ -7,7 +8,8 @@ import { yahooConnector } from './yahoo/yahooConnector.js';
 const registry: Record<InstrumentSource, MarketDataConnector> = {
   binance: binanceConnector,
   yahoo: yahooConnector,
-  ib: ibConnector
+  ib: ibConnector,
+  databento: databentoConnector
 };
 
 export const getConnector = (source: InstrumentSource): MarketDataConnector => registry[source];

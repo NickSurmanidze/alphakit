@@ -322,6 +322,7 @@ export const InstrumentDetailPage = () => {
             <SelectItem value="binance">{SOURCE_LABELS.binance}</SelectItem>
             <SelectItem value="yahoo">{SOURCE_LABELS.yahoo}</SelectItem>
             <SelectItem value="ib">{SOURCE_LABELS.ib}</SelectItem>
+            <SelectItem value="databento">{SOURCE_LABELS.databento}</SelectItem>
           </SelectContent>
         </Select>
 

@@ -77,7 +77,7 @@ const startBackfill = async (params: {
 
 const DEFAULT_BACKFILL_DAYS = 30;
 
-const sourceSchema = z.enum(['binance', 'yahoo', 'ib']);
+const sourceSchema = z.enum(['binance', 'yahoo', 'ib', 'databento']);
 const assetClassSchema = z.enum(['spot', 'perpetual', 'equity', 'future', 'index', 'forex']);
 const baseResolutionSchema = z.enum(['1_minute', '5_minute', '1_hour', '1_day']);
 const DEFAULT_RESOLUTIONS: BaseResolution[] = ['1_hour'];

@@ -26,7 +26,12 @@ const envSchema = z.object({
   // account configured -- the ib connector fails loudly on first use instead.
   IB_GATEWAY_HOST: z.string().default('localhost'),
   IB_GATEWAY_PORT: z.coerce.number().int().positive().default(4004),
-  IB_CLIENT_ID: z.coerce.number().int().nonnegative().default(11)
+  IB_CLIENT_ID: z.coerce.number().int().nonnegative().default(11),
+
+  // Databento Historical API key (https://databento.com/portal/keys). Optional, like the IB vars
+  // above, so the app still boots without a Databento account configured -- the databento
+  // connector fails loudly on first use instead.
+  DATABENTO_API_KEY: z.string().optional()
 });
 
 export const env = envSchema.parse(process.env);

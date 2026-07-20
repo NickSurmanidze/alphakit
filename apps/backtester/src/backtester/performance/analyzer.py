@@ -95,24 +95,33 @@ class PerformanceAnalyzer:
         return self.exchange.event_log if self.exchange else None
 
     def _get_realized_pnls(self) -> list[float]:
-        """Realized dollar PnL for every position close/reduce/liquidation, sourced
-        from the EventLog: PositionClosed/PositionReduced carry their own
-        realized_pnl_in_usd; PositionLiquidated doesn't (it forfeits the position's
-        entire margin, per Positions.liquidate_position), so that loss is reconstructed
-        as -margin_used_in_usd. Uses _realized_pnls_override instead if merge_reports()
-        set one (a merged analyzer has no live exchange/event_log of its own). Empty if
-        neither is available (e.g. event logging was disabled on the source exchange)."""
+        """Realized dollar PnL for every position close/reduce/liquidation. Uses
+        _realized_pnls_override instead if merge_reports() set one (a merged analyzer
+        has no live exchange/event_log of its own). Empty if neither is available
+        (e.g. event logging was disabled on the source exchange)."""
         if self._realized_pnls_override is not None:
             return self._realized_pnls_override
+        return [pnl for _, pnl in self._get_realized_pnls_with_time()]
+
+    def _get_realized_pnls_with_time(self) -> list[tuple[pd.Timestamp, float]]:
+        """Same events as _get_realized_pnls(), paired with each event's own
+        timestamp -- needed to slice realized PnL by period in
+        generate_period_report() (the flat list _get_realized_pnls() itself returns
+        has no timestamps to filter by). Sourced from the EventLog:
+        PositionClosed/PositionReduced carry their own realized_pnl_in_usd;
+        PositionLiquidated doesn't (it forfeits the position's entire margin, per
+        Positions.liquidate_position), so that loss is reconstructed as
+        -margin_used_in_usd. Ignores _realized_pnls_override (a merge_reports()
+        target has no per-event timestamps of its own to give)."""
         if self.event_log is None:
             return []
-        pnls: list[float] = []
+        pairs: list[tuple[pd.Timestamp, float]] = []
         for event in self.event_log.get_events():
             if isinstance(event, (PositionClosed, PositionReduced)):
-                pnls.append(event.realized_pnl_in_usd)
+                pairs.append((pd.Timestamp(event.time), event.realized_pnl_in_usd))
             elif isinstance(event, PositionLiquidated):
-                pnls.append(-event.margin_used_in_usd)
-        return pnls
+                pairs.append((pd.Timestamp(event.time), -event.margin_used_in_usd))
+        return pairs
 
     # ------------------------------------------------------------------
     # Snapshot collection
@@ -317,6 +326,70 @@ class PerformanceAnalyzer:
     # Report generation (no side effects on chart output)
     # ------------------------------------------------------------------
 
+    def _algo_metric_block(  # noqa: PLR0913
+        self,
+        returns: pd.Series,
+        cum: pd.Series,
+        trades: list[Trade],
+        realized_pnls: list[float],
+        exposure: pd.Series,
+        n_days: int,
+    ) -> dict[str, float]:
+        """The full algo-side metric set (Sharpe, Sortino, CAGR, drawdown, Ulcer
+        Index, VaR/CVaR, skew/kurtosis, profit factor, win rate, R-multiple
+        expectancy, ...), computed from whatever `returns`/`cum`/`trades`/
+        `realized_pnls`/`exposure`/`n_days` are handed to it. Shared by
+        generate_report() (the whole-history period) and generate_period_report()
+        (each year/quarter sub-period) so both stay numerically in sync from one
+        place instead of two independently-maintained copies of the same ~25-metric
+        block. Recomputes high-watermark/drawdown from `cum` rather than reading a
+        pre-built column, since a sub-period's `cum` isn't backed by one."""
+        gross_return = float(cum.iloc[-1]) if len(cum) else 1.0
+        high_watermark = cum.cummax()
+        drawdown = (high_watermark - cum) / high_watermark * -1
+        max_dd = float(drawdown.min()) if len(drawdown) else 0.0
+        ann_return = metrics.cagr(gross_return, n_days)
+
+        return {
+            "gross_return_percent": gross_return * 100,
+            "net_return_percent": (gross_return - 1) * 100,
+            "max_drawdown_percent": round(max_dd, 6) * 100,
+            "max_drawdown_duration_days": float(metrics.max_drawdown_duration_days(cum)),
+            "sharpe_ratio": metrics.sharpe_ratio(
+                returns, self.risk_free_rate, self.periods_per_year
+            ),
+            "sortino_ratio": metrics.sortino_ratio(
+                returns, self.risk_free_rate, self.periods_per_year
+            ),
+            "annualized_volatility_percent": (
+                metrics.annualized_volatility(returns, self.periods_per_year) * 100
+            ),
+            "cagr_percent": ann_return * 100,
+            "calmar_ratio": metrics.calmar_ratio(ann_return, max_dd),
+            "recovery_factor": metrics.recovery_factor(gross_return - 1, max_dd),
+            "ulcer_index": metrics.ulcer_index(cum),
+            "var_95_percent": metrics.value_at_risk(returns, 0.95) * 100,
+            "cvar_95_percent": metrics.conditional_value_at_risk(returns, 0.95) * 100,
+            "returns_skewness": metrics.returns_skewness(returns),
+            "returns_kurtosis": metrics.returns_kurtosis(returns),
+            "profit_factor": metrics.profit_factor(trades),
+            "dollar_profit_factor": metrics.dollar_profit_factor(realized_pnls),
+            "dollar_expectancy": metrics.dollar_expectancy(realized_pnls),
+            "win_rate_percent": metrics.win_rate(trades) * 100,
+            "avg_win_loss_ratio": metrics.avg_win_loss_ratio(trades),
+            "r_multiple_expectancy": metrics.r_multiple_expectancy(trades),
+            "max_consecutive_losses": float(metrics.max_consecutive_losses(trades)),
+            "avg_holding_period_min": metrics.avg_holding_period_minutes(trades),
+            "time_in_market_percent": metrics.time_in_market_percent(exposure),
+            "closed_trades": float(len(trades)),
+            "winner_trades": float(
+                sum(1 for t in trades if t.result is not None and t.result.value == "winner")
+            ),
+            "loser_trades": float(
+                sum(1 for t in trades if t.result is not None and t.result.value == "loser")
+            ),
+        }
+
     def generate_report(self) -> dict[str, dict[str, float]] | None:
         """Builds self.merged and populates self.summary with the full metric set
         (Sharpe, Sortino, CAGR, drawdown, Ulcer Index, VaR/CVaR, skew/kurtosis, profit
@@ -331,52 +404,16 @@ class PerformanceAnalyzer:
         algo_returns = self.merged[f"{self.key}__simple_returns"].dropna()
         algo_cum = self.merged[f"{self.key}__cumulative_returns"]
         n_days = (self.merged.index[-1] - self.merged.index[0]).days or 1
-        gross_return = float(algo_cum.values[-1])
-        max_dd = float(self.merged[f"{self.key}__drawdown"].min())
-        ann_return = metrics.cagr(gross_return, n_days)
         realized_pnls = self._get_realized_pnls()
 
-        self.summary[self.key] = {
-            "sharpe_ratio": metrics.sharpe_ratio(
-                algo_returns, self.risk_free_rate, self.periods_per_year
-            ),
-            "sortino_ratio": metrics.sortino_ratio(
-                algo_returns, self.risk_free_rate, self.periods_per_year
-            ),
-            "annualized_volatility_percent": (
-                metrics.annualized_volatility(algo_returns, self.periods_per_year) * 100
-            ),
-            "cagr_percent": ann_return * 100,
-            "calmar_ratio": metrics.calmar_ratio(ann_return, max_dd),
-            "recovery_factor": metrics.recovery_factor(gross_return - 1, max_dd),
-            "max_drawdown_percent": round(max_dd, 6) * 100,
-            "max_drawdown_duration_days": float(metrics.max_drawdown_duration_days(algo_cum)),
-            "ulcer_index": metrics.ulcer_index(algo_cum),
-            "var_95_percent": metrics.value_at_risk(algo_returns, 0.95) * 100,
-            "cvar_95_percent": metrics.conditional_value_at_risk(algo_returns, 0.95) * 100,
-            "returns_skewness": metrics.returns_skewness(algo_returns),
-            "returns_kurtosis": metrics.returns_kurtosis(algo_returns),
-            "gross_return_percent": gross_return * 100,
-            "net_return_percent": (gross_return - 1) * 100,
-            "profit_factor": metrics.profit_factor(self.trades),
-            "dollar_profit_factor": metrics.dollar_profit_factor(realized_pnls),
-            "dollar_expectancy": metrics.dollar_expectancy(realized_pnls),
-            "win_rate_percent": metrics.win_rate(self.trades) * 100,
-            "avg_win_loss_ratio": metrics.avg_win_loss_ratio(self.trades),
-            "r_multiple_expectancy": metrics.r_multiple_expectancy(self.trades),
-            "max_consecutive_losses": float(metrics.max_consecutive_losses(self.trades)),
-            "avg_holding_period_min": metrics.avg_holding_period_minutes(self.trades),
-            "time_in_market_percent": metrics.time_in_market_percent(
-                self.merged[f"{self.key}__exchange_gross_exposure"]
-            ),
-            "closed_trades": float(len(self.trades)),
-            "winner_trades": float(
-                sum(1 for t in self.trades if t.result is not None and t.result.value == "winner")
-            ),
-            "loser_trades": float(
-                sum(1 for t in self.trades if t.result is not None and t.result.value == "loser")
-            ),
-        }
+        self.summary[self.key] = self._algo_metric_block(
+            returns=algo_returns,
+            cum=algo_cum,
+            trades=self.trades,
+            realized_pnls=realized_pnls,
+            exposure=self.merged[f"{self.key}__exchange_gross_exposure"],
+            n_days=n_days,
+        )
 
         for symbol in self.benchmark_symbols:
             sym_returns = self.merged[f"{symbol}__simple_returns"].dropna()
@@ -420,6 +457,60 @@ class PerformanceAnalyzer:
 
         return self.summary
 
+    def generate_period_report(self, freq: str) -> dict[str, dict[str, float]]:
+        """Adds one extra self.summary entry per `freq`-period (e.g. `algo_2019`,
+        `algo_2020` for `freq="Y"`; `algo_2019Q3` for `freq="Q"` -- any pandas period
+        alias works) alongside the whole-history `self.summary[self.key]` entry
+        generate_report() already builds. Same metric set, via the same
+        _algo_metric_block() helper, computed from just that period's own slice of
+        merged/trades/realized PnLs rather than the whole history.
+
+        Cumulative return/drawdown are recomputed *within each period* (compounding
+        restarts at 1.0 at the period's first bar) rather than sliced out of the
+        whole-history cumulative series -- otherwise every later period would just
+        look like "the whole history so far" instead of how that period did on its
+        own.
+
+        Requires generate_report() to have already run (needs self.merged/
+        self.trades in their final state) -- no-ops, returning self.summary
+        unchanged, if there's no merged data yet.
+        """
+        if self.merged is None or self.merged.shape[0] == 0:
+            return self.summary
+
+        returns_col = f"{self.key}__simple_returns"
+        exposure_col = f"{self.key}__exchange_gross_exposure"
+        realized_pnls_with_time = self._get_realized_pnls_with_time()
+        period_index = pd.DatetimeIndex(self.merged.index).to_period(freq)
+
+        for period in period_index.unique():
+            period_merged = self.merged.loc[period_index == period]
+            period_returns = period_merged[returns_col].dropna()
+            if period_returns.empty:
+                continue
+
+            period_cum = (1 + period_returns).cumprod()
+            period_n_days = (period_merged.index[-1] - period_merged.index[0]).days or 1
+            period_trades = [
+                t
+                for t in self.trades
+                if t.time_close is not None and t.time_close.to_period(freq) == period
+            ]
+            period_pnls = [
+                pnl for ts, pnl in realized_pnls_with_time if ts.to_period(freq) == period
+            ]
+
+            self.summary[f"{self.key}_{period}"] = self._algo_metric_block(
+                returns=period_returns,
+                cum=period_cum,
+                trades=period_trades,
+                realized_pnls=period_pnls,
+                exposure=period_merged[exposure_col],
+                n_days=period_n_days,
+            )
+
+        return self.summary
+
     def summary_dataframe(self) -> pd.DataFrame:
         """Reshapes self.summary (a dict keyed by self.key/benchmark symbol, each a
         dict of metric name -> value) into a DataFrame -- one row per metric, one
@@ -431,13 +522,33 @@ class PerformanceAnalyzer:
         df.index.name = "metric"
         return df
 
-    def summary_html_table(self) -> str:
+    def summary_html_table(self, split: str | None = None) -> str:
         """HTML rendering of summary_dataframe(): a plain-English description column
         plus color-coding (absolute quality bands where a fixed threshold is
         meaningful, a "best in row" highlight across columns otherwise) -- see
         backtester.performance.report_html for the per-metric rules. Wrap the
-        returned string in IPython.display.HTML(...) to render in a notebook."""
-        return render_summary_html(self.summary_dataframe())
+        returned string in IPython.display.HTML(...) to render in a notebook.
+
+        split, if given ("Y" for calendar year, "Q" for calendar quarter, or any
+        other pandas period alias), calls generate_period_report(split) and inserts
+        one extra column per period right after the whole-history algo column --
+        e.g. algo, algo_2019, algo_2020, ..., then the benchmark column(s) as usual.
+        Omit (the default) for the original single-column-per-key table, unchanged.
+        """
+        if split is None:
+            return render_summary_html(self.summary_dataframe())
+
+        self.generate_period_report(split)
+        df = self.summary_dataframe()
+
+        period_prefix = f"{self.key}_"
+        period_cols = sorted(
+            (c for c in df.columns if str(c).startswith(period_prefix)),
+            key=lambda c: str(c)[len(period_prefix):],
+        )
+        other_cols = [c for c in df.columns if c != self.key and c not in period_cols]
+        ordered_cols = [self.key, *period_cols, *other_cols]
+        return render_summary_html(df[ordered_cols])
 
     # ------------------------------------------------------------------
     # Chart output — explicit opt-in

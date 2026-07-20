@@ -323,3 +323,143 @@ class TestMergeReportsPropagatesNewFields:
 
         assert merged.periods_per_year == 252
         assert merged._get_realized_pnls() == pytest.approx([0.0, 0.0])
+
+
+def _make_daily_ohlc_df(dates: pd.DatetimeIndex, closes: list[float]) -> pd.DataFrame:
+    """Same column shape as conftest.make_ohlc_df (time_open/time_close/OHLCV,
+    indexed by time_close named "ts"), but daily-interval and caller-supplied dates
+    -- build_market's own helper hardcodes an hourly interval from a fixed start, too
+    fine-grained to reach across a year/quarter boundary in a hand-traceable test."""
+    rows = []
+    for d, close in zip(dates, closes, strict=True):
+        time_open = d
+        time_close = d + pd.Timedelta("1D") - pd.Timedelta("1ms")
+        rows.append(
+            {
+                "time_open": time_open,
+                "time_close": time_close,
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 0.0,
+            }
+        )
+    df = pd.DataFrame(rows)
+    df.index = df["time_close"]
+    df.index.name = "ts"
+    return df
+
+
+class TestGeneratePeriodReport:
+    def _build_two_year_analyzer(self) -> PerformanceAnalyzer:
+        """~18 months of daily BTC/USD candles spanning 2024 into 2025, oscillating
+        price so per-year returns/Sharpe aren't degenerate within either year alone,
+        plus one manufactured trade closed in each year."""
+        dates = pd.date_range("2024-06-01", "2025-06-30", freq="D")
+        closes = [100.0 + 10 * ((i % 4) - 1.5) for i in range(len(dates))]
+        market = Market()
+        market.add_market(symbol="BTC/USD", df=_make_daily_ohlc_df(dates, closes))
+        market.compile()
+
+        exchange = make_exchange(market, max_leverage=1)
+        exchange.transactions.add_deposit(asset="USD", volume=10000)
+        analyzer = PerformanceAnalyzer(
+            market=market, exchange=exchange, benchmark_symbols=["BTC/USD"], periods_per_year=252
+        )
+
+        analyzer.take_snapshot()
+        for _ in range(len(dates) - 1):
+            market.set_next_candle_as_current_market()
+            exchange.run_step()
+            analyzer.take_snapshot()
+
+        trade_2024 = Trade()
+        trade_2024.symbol = "BTC/USD"
+        trade_2024.side = PositionSide.long
+        trade_2024.time_close = pd.Timestamp("2024-09-15")
+        trade_2024.pnl = 0.05
+        trade_2024.result = TradeResult.winner
+        trade_2024.risk_percent = 0.02
+
+        trade_2025 = Trade()
+        trade_2025.symbol = "BTC/USD"
+        trade_2025.side = PositionSide.long
+        trade_2025.time_close = pd.Timestamp("2025-03-10")
+        trade_2025.pnl = -0.03
+        trade_2025.result = TradeResult.loser
+        trade_2025.risk_percent = 0.02
+
+        analyzer.trades = [trade_2024, trade_2025]
+        analyzer.generate_report()
+        return analyzer
+
+    def test_adds_one_summary_entry_per_year_alongside_the_whole_period_one(self):
+        analyzer = self._build_two_year_analyzer()
+
+        analyzer.generate_period_report("Y")
+
+        assert "algo" in analyzer.summary  # whole-period entry untouched
+        assert "algo_2024" in analyzer.summary
+        assert "algo_2025" in analyzer.summary
+        assert analyzer.summary["algo"]["closed_trades"] == 2
+        assert analyzer.summary["algo_2024"]["closed_trades"] == 1
+        assert analyzer.summary["algo_2025"]["closed_trades"] == 1
+        assert analyzer.summary["algo_2024"]["winner_trades"] == 1
+        assert analyzer.summary["algo_2025"]["loser_trades"] == 1
+
+    def test_period_cumulative_return_restarts_at_1_each_period(self):
+        # Each period's own gross_return_percent should reflect only that period's
+        # compounding, not the whole history's -- e.g. year 2 shouldn't look like
+        # "everything through year 1 plus year 2" just because it's chronologically
+        # later.
+        analyzer = self._build_two_year_analyzer()
+        analyzer.generate_period_report("Y")
+
+        whole_period_gross = analyzer.summary["algo"]["gross_return_percent"]
+        year_2024_gross = analyzer.summary["algo_2024"]["gross_return_percent"]
+        year_2025_gross = analyzer.summary["algo_2025"]["gross_return_percent"]
+
+        # The oscillating price returns to ~the same level periodically, so no
+        # single year's return should be anywhere near the multi-year compounded one.
+        assert abs(year_2024_gross - 100) < abs(whole_period_gross - 100) + 1
+        assert abs(year_2025_gross - 100) < abs(whole_period_gross - 100) + 1
+
+    def test_quarter_split_produces_quarter_labeled_keys(self):
+        analyzer = self._build_two_year_analyzer()
+
+        analyzer.generate_period_report("Q")
+
+        quarter_keys = [
+            k for k in analyzer.summary if k.startswith("algo_2024Q") or k.startswith("algo_2025Q")
+        ]
+        assert len(quarter_keys) >= 4  # at least a few real quarters in an 18-month span
+
+    def test_noop_before_generate_report(self):
+        market = build_market(
+            {"BTC/USD": [{"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0}]}
+        )
+        analyzer = PerformanceAnalyzer(market=market, benchmark_symbols=[])
+        result = analyzer.generate_period_report("Y")
+        assert result == {}
+
+    def test_summary_html_table_split_orders_period_columns_right_after_algo(self):
+        analyzer = self._build_two_year_analyzer()
+
+        html = analyzer.summary_html_table(split="Y")
+
+        algo_idx = html.index(">algo<")
+        algo_2024_idx = html.index(">algo_2024<")
+        algo_2025_idx = html.index(">algo_2025<")
+        benchmark_idx = html.index(">BTC/USD<")
+        assert algo_idx < algo_2024_idx < algo_2025_idx < benchmark_idx
+
+    def test_summary_html_table_without_split_is_unchanged(self):
+        analyzer = self._build_two_year_analyzer()
+
+        html = analyzer.summary_html_table()
+
+        assert ">algo<" in html
+        assert ">BTC/USD<" in html
+        assert "algo_2024" not in html
+        assert "algo_2025" not in html
